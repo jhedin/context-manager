@@ -58,25 +58,56 @@ class ContextManager extends EventEmitter {
     );
   }
 
-  // Segment history into logical topics with message metadata
+  // Segment history into logical topics with smart naming
   getTopics() {
     const history = this.agent.history;
     const topics = [];
-    let currentTopic = { id: 1, name: "Initial Research", tokens: 0, messages: [] };
+    let currentTopic = { id: 1, name: "[Research] Initial Context", tokens: 0, messages: [] };
+
+    const categorize = (text, tools = []) => {
+      const lower = text.toLowerCase();
+      if (tools.some(t => t.name === 'EnterPlanMode') || lower.includes('plan')) return 'Plan';
+      if (lower.includes('review') || lower.includes('audit')) return 'Review';
+
+      const isVerification = lower.includes('test') || lower.includes('verify') || lower.includes('run');
+      const isAct = lower.includes('fix') || lower.includes('update') || lower.includes('implement');
+
+      if (isVerification && isAct) return 'Iteration Loop';
+      if (isVerification) return 'Verification';
+      if (isAct) return 'Act';
+      if (lower.includes('read') || lower.includes('check') || lower.includes('explore')) return 'Research';
+      return 'Research';
+    };
+
+    let lastCategory = '';
+    let iterationCount = 0;
 
     history.forEach((msg, idx) => {
-      const isPlanMode = msg.role === 'assistant' && 
-                         msg.content && 
-                         Array.isArray(msg.content) && 
-                         msg.content.some(c => c.name === 'EnterPlanMode');
+      const content = Array.isArray(msg.content) ? msg.content : [];
+      const toolUses = content.filter(c => c.type === 'tool_use');
+      const textContent = content.find(c => c.type === 'text')?.text || '';
 
-      if (isPlanMode) {
-        topics.push(currentTopic);
-        const planName = msg.content.find(c => c.name === 'EnterPlanMode')?.arguments?.objective || `Topic ${topics.length + 1}`;
-        currentTopic = { id: topics.length + 1, name: planName, tokens: 0, messages: [] };
+      const category = categorize(textContent, toolUses);
+      const isTopicShift = textContent.toLowerCase().startsWith('now ') || 
+                           textContent.toLowerCase().startsWith('next ') ||
+                           toolUses.some(t => t.name === 'EnterPlanMode');
+
+      if (lastCategory === 'Verification' && category === 'Act') {
+        iterationCount++;
       }
 
-      const msgTokens = JSON.stringify(msg).length / 4;
+      if (isTopicShift && idx > 0) {
+        topics.push(currentTopic);
+        let label = `[${category}]`;
+        if (iterationCount > 0 && (category === 'Act' || category === 'Verification')) {
+          label = `[Iteration ${iterationCount}: ${category}]`;
+        }
+
+        const shortName = textContent.split(/[.!?]/)[0].substring(0, 40);
+        currentTopic = { id: topics.length + 1, name: `${label} ${shortName}`, tokens: 0, messages: [] };
+        lastCategory = category;
+      }
+      const msgTokens = JSON.parse(JSON.stringify(msg)).length / 4;
       currentTopic.tokens += msgTokens;
       currentTopic.messages.push({ ...msg, originalIndex: idx });
     });
@@ -114,15 +145,16 @@ class ContextManager extends EventEmitter {
       name: 'action',
       message: `Managing Topic: ${topic.name}`,
       choices: [
-        { name: 'PRUNE_ALL', message: 'Prune Entire Topic' },
-        { name: 'DIVE', message: 'Dive Deeper (Granular Pruning)' },
+        { name: 'BYPASS_ALL', message: 'Bypass Entire Topic (Remove from DAG, keep in file)' },
+        { name: 'DIVE', message: 'Dive Deeper (Selective Bypass)' },
         { name: 'BACK', message: 'Back to Overview' }
       ]
     });
 
     const action = await subPrompt.run();
-    if (action === 'PRUNE_ALL') {
-      this.executePruning([topic.id]);
+    if (action === 'BYPASS_ALL') {
+      const uuids = topic.messages.map(m => m.uuid);
+      this.unlinkMessagesFromDag(uuids);
     } else if (action === 'DIVE') {
       await this.diveDeeperUI(topic);
     }
@@ -145,51 +177,75 @@ class ContextManager extends EventEmitter {
     });
 
     if (candidates.length === 0) {
-      console.log("No prunable tool results found in this topic.");
+      console.log("No bypass candidates found in this topic.");
       return;
     }
 
     const divePrompt = new MultiSelect({
       name: 'selections',
-      message: 'Select individual results to prune (Space to toggle, Enter to confirm)',
+      message: 'Select items to BYPASS (Remove from DAG, keep in file)',
       choices: candidates.map((c, i) => ({ name: c.summary, value: i }))
     });
 
     const selections = await divePrompt.run();
-    selections.forEach(selName => {
+    const uuidsToBypass = selections.map(selName => {
       const candidate = candidates.find(c => c.summary === selName);
-      this.pruneIndividualResult(candidate);
+      return candidate.messageId;
     });
-  }
 
-  pruneIndividualResult(candidate) {
-    const msg = this.agent.history.find(m => m.uuid === candidate.messageId);
-    if (msg) {
-      const toolContent = msg.content[candidate.contentIndex];
-      const originalLength = toolContent.content.length;
-      toolContent.content = `[Pruned: ${originalLength} characters of tool output]`;
-      console.log(`[Pruning] Granularly pruned ${Math.round(originalLength / 1024)} KB.`);
+    if (uuidsToBypass.length > 0) {
+      this.unlinkMessagesFromDag(uuidsToBypass);
+      console.log(`[Pruning] Bypassed ${uuidsToBypass.length} messages.`);
     }
   }
 
-  executePruning(topicIds) {
-    const topics = this.getTopics();
-    topicIds.forEach(id => {
-      const topic = topics.find(t => t.id === id);
-      if (topic) {
-        topic.messages.forEach(topicMsg => {
-          const actualMsg = this.agent.history.find(m => m.uuid === topicMsg.uuid);
-          if (actualMsg && actualMsg.role === 'user' && Array.isArray(actualMsg.content)) {
-            actualMsg.content.forEach(c => {
-              if (c.type === 'tool_result' && c.content && c.content.length > 500) {
-                c.content = `[Pruned: ${c.content.length} characters of tool output]`;
-              }
-            });
+  unlinkMessagesFromDag(messageUuids) {
+    const history = this.agent.history;
+    const toRemove = new Set(messageUuids);
+
+    history.forEach((msg, idx) => {
+      if (toRemove.has(msg.parentUuid)) {
+        let currentParent = msg.parentUuid;
+        let ancestor = null;
+
+        while (currentParent) {
+          const parentMsg = history.find(m => m.uuid === currentParent);
+          if (!parentMsg) break;
+          if (!toRemove.has(parentMsg.parentUuid)) {
+            ancestor = parentMsg.parentUuid;
+            break;
           }
-        });
+          currentParent = parentMsg.parentUuid;
+        }
+
+        if (ancestor) {
+          console.log(`[DAG Bypass] Re-parenting ${msg.uuid.substring(0,8)} to grandparent ${ancestor.substring(0,8)}`);
+          msg.parentUuid = ancestor;
+        }
       }
     });
-    console.log(`[Pruning] Topic-level pruning complete.`);
+
+    this.agent.history = history.filter(m => !toRemove.has(m.uuid));
+    this.verifyHistoryIntegrity();
+  }
+
+  verifyHistoryIntegrity() {
+    const history = this.agent.history;
+    const uuids = new Set(history.map(m => m.uuid));
+    let errors = [];
+
+    history.forEach((msg, idx) => {
+      if (idx > 0 && (!msg.parentUuid || !uuids.has(msg.parentUuid))) {
+        errors.push(`Orphan message at index ${idx}: parentUuid ${msg.parentUuid} not found.`);
+      }
+    });
+
+    if (errors.length > 0) {
+      console.error("[Integrity Error] DAG broken:", errors);
+      return false;
+    }
+    console.log("[Integrity Check] DAG is healthy.");
+    return true;
   }
 
   resetTrigger() {
@@ -197,13 +253,20 @@ class ContextManager extends EventEmitter {
   }
 }
 
-// Scaffolding for launch
 async function startAgent() {
-  const agent = new ClaudeAgent({ apiKeySource: 'none', permissionMode: 'not-set' });
+  const agent = new ClaudeAgent({ 
+    apiKeySource: 'none', 
+    permissionMode: 'not-set' 
+  });
+
   const manager = new ContextManager(agent);
-  console.log("Context Manager Active.");
-  console.log("- Auto-Trigger: High context shifts agent to Plan Mode.");
-  console.log("- Manual-Trigger: Type /compact-ui to prune history.");
+  
+  console.log("\n--- Custom Context Manager V1 ---");
+  console.log("Monitoring session usage...");
+  console.log("- Auto-Trigger: Shift to Plan Mode at 80% usage.");
+  console.log("- Manual Command: Type /compact-ui to prune history.\n");
+
+  await agent.run();
 }
 
 if (require.main === module) {
