@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+
+/**
+ * Claude Code Stop Hook - Model-Aware Context Monitor
+ */
+
+const MODEL_LIMITS = {
+  'claude-3-7-sonnet': 1000000, // New default for 3.7
+  'claude-3-5-sonnet': 200000,
+  'claude-3-5-opus': 200000,
+  'claude-3-haiku': 200000
+};
+
+async function main() {
+  try {
+    const input = fs.readFileSync(0, 'utf8');
+    if (!input) return;
+    
+    const hookData = JSON.parse(input);
+    const transcriptPath = hookData.transcript_path;
+    if (!transcriptPath) return;
+
+    fs.writeFileSync('.claude/session_path.txt', transcriptPath);
+
+    const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(l => l.trim());
+    const lastLine = JSON.parse(lines[lines.length - 1]);
+    const usage = lastLine.message?.usage;
+    const modelId = lastLine.message?.model || '';
+
+    if (usage) {
+      // 1. Determine Max Tokens (Priority: Env Var > Model Map > Usage Ceiling)
+      let maxTokens = parseInt(process.env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE) || 0;
+      
+      if (!maxTokens) {
+        // Find matching model limit
+        const modelMatch = Object.keys(MODEL_LIMITS).find(m => modelId.includes(m));
+        maxTokens = modelMatch ? MODEL_LIMITS[modelMatch] : 1000000; // Default to 1M for unknown new models
+      }
+
+      // 2. Determine Trigger Percentage (Default 85%, or 5% below Auto-Compact)
+      const autoCompactPct = parseInt(process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) || 90;
+      const triggerPct = Math.max(70, autoCompactPct - 5); 
+
+      const currentUsage = usage.input_tokens;
+      const usagePercent = (currentUsage / maxTokens) * 100;
+
+      if (usagePercent > triggerPct) {
+        process.stderr.write(
+          `[CONTEXT MONITOR] Model: ${modelId}\n` +
+          `Usage: ${Math.round(usagePercent)}% of ${maxTokens.toLocaleString()} tokens.\n` +
+          `ACTION REQUIRED: Enter Plan Mode and call 'open_pruning_dashboard'.`
+        );
+        process.exit(2);
+      }
+    }
+  } catch (err) {
+    process.exit(0);
+  }
+}
+
+main();

@@ -10,7 +10,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@anthropic-ai/claude-code": "^2.1.75",
