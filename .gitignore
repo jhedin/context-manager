@@ -1,1 +1,16 @@
 node_modules/
+
+# Runtime artifacts
+.claude/backups/
+.claude/context_sidecar.json
+.claude/session_path.txt
+.claude/hooks/*.log
+.claude/pending_reparent.json
+
+# Test fixtures
+test_session.jsonl
+session_backup.jsonl
+
+# Dev scripts
+dump_hook.js
+self_resume.sh
