@@ -179,10 +179,12 @@ function findActiveTail(history) {
   for (const e of history) {
     if (e.parentUuid) childCount.set(e.parentUuid, (childCount.get(e.parentUuid) || 0) + 1);
   }
-  // Walk backwards — first entry with a uuid, no children, and not a dormant
-  // summary (which has parentUuid: null and sits outside the active chain).
+  // Walk backwards — first entry with a uuid, no children, and not disconnected
+  // from the chain (dormant summaries and orphaned sidechains have parentUuid: null
+  // but aren't real chain members).
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].uuid && !childCount.has(history[i].uuid) && !history[i].dormantSummaryFor) return history[i];
+    const e = history[i];
+    if (e.uuid && !childCount.has(e.uuid) && !e.dormantSummaryFor && !e.isSidechain) return e;
   }
   return history[history.length - 1]; // fallback
 }
@@ -1210,9 +1212,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return textResult(`Unknown tool: ${toolName}`);
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// --- Exports for testing ---
+if (typeof module !== 'undefined') {
+  module.exports = {
+    buildUuidMap, findActiveTail, getActiveChainUuids, getTextContent,
+    analyzeEntry, getTopics, scorePruningCandidates, checkForInflightWork,
+    bypassTopic, restoreTopic, createDormantSummary, findDormantSummary,
+    activateSummary, summarizeTopic, findTopicById, validateSessionPath,
+    guardInflight, readHistory, safeWriteHistory
+  };
 }
 
-main().catch(console.error);
+// Start server only when run directly (not when required by tests)
+if (require.main === module) {
+  async function main() {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
+  main().catch(console.error);
+}
