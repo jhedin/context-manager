@@ -487,15 +487,19 @@ function createDormantSummary(history, topic, summaryText) {
     cwd: templateEntry.cwd,
     version: templateEntry.version,
     message: {
+      model: 'claude-opus-4-6',
       role: 'assistant',
+      stop_reason: 'tool_use',
       content: [{
         type: 'tool_use',
         id: toolUseId,
         name: 'Agent',
         input: {
           description: `Summarize topic: ${topic.name}`,
-          subagent_type: 'summarizer'
-        }
+          subagent_type: 'summarizer',
+          prompt: `Summarize this topic for context compression: ${topic.name}`
+        },
+        caller: { type: 'direct' }
       }]
     }
   };
@@ -515,7 +519,12 @@ function createDormantSummary(history, topic, summaryText) {
       content: [{
         type: 'tool_result',
         tool_use_id: toolUseId,
-        content: `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}`
+        // content must be an array of content blocks (not a plain string)
+        // so Claude Code renders it as a subagent result
+        content: [{
+          type: 'text',
+          text: `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}`
+        }]
       }]
     }
   };

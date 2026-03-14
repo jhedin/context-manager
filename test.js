@@ -358,7 +358,11 @@ test('summarizeTopic creates inline when no dormant', () => {
   assertNoOrphans(result, 'after inline summarize');
   // Result entry (tail of pair) should be in chain
   const resultEntry = result.find(e =>
-    e.message?.content?.some(b => b.type === 'tool_result' && typeof b.content === 'string' && b.content.includes('Inline summary'))
+    e.message?.content?.some(b =>
+      b.type === 'tool_result' &&
+      Array.isArray(b.content) &&
+      b.content.some(c => c.type === 'text' && c.text?.includes('Inline summary'))
+    )
   );
   assert(resultEntry, 'result entry should exist');
   const active = getActiveChainUuids(result);
