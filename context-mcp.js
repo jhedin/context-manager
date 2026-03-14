@@ -25,6 +25,25 @@ function getAutoSessionPath() {
   return null;
 }
 
+/**
+ * Validate that a session path is a .jsonl file inside a known Claude directory.
+ * Prevents path traversal attacks via user-provided session_path.
+ */
+function validateSessionPath(filePath) {
+  const resolved = path.resolve(filePath);
+  if (!resolved.endsWith('.jsonl')) return 'Session path must be a .jsonl file.';
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const allowedPrefixes = [
+    path.join(home, '.claude'),
+    path.resolve('.claude'),
+    path.resolve('test_session.jsonl'), // allow test fixture
+  ];
+  if (!allowedPrefixes.some(p => resolved.startsWith(p) || resolved === p)) {
+    return `Session path must be inside a .claude directory: ${resolved}`;
+  }
+  return null;
+}
+
 function readHistory(filePath) {
   if (!fs.existsSync(filePath)) return [];
   return fs.readFileSync(filePath, 'utf8')
@@ -80,8 +99,10 @@ function listBackups(filePath) {
     .map(f => {
       const fullPath = path.join(BACKUP_DIR, f);
       const stat = fs.statSync(fullPath);
-      const lines = fs.readFileSync(fullPath, 'utf8').split('\n').filter(l => l.trim()).length;
-      return { name: f, path: fullPath, size: stat.size, lines, mtime: stat.mtime.toISOString() };
+      // Estimate entry count from file size (~250 bytes/entry avg) instead of
+      // reading every backup file. Avoids 100MB+ I/O for 20 backups.
+      const estimatedEntries = Math.round(stat.size / 250);
+      return { name: f, path: fullPath, size: stat.size, estimatedEntries, mtime: stat.mtime.toISOString() };
     });
 }
 
@@ -92,8 +113,12 @@ function safeWriteHistory(filePath, entries) {
   //
   // Backups are handled by the PreToolUse hook (pre-backup.js), which fires
   // before this tool even executes. This way even a crash mid-write is safe.
-  fs.writeFileSync(filePath, entries.map(e => JSON.stringify(e)).join('\n') + '\n');
-  return { ok: true };
+  try {
+    fs.writeFileSync(filePath, entries.map(e => JSON.stringify(e)).join('\n') + '\n');
+    return { ok: true };
+  } catch (err) {
+    return { error: `Failed to write session file: ${err.message}` };
+  }
 }
 
 /**
@@ -276,6 +301,8 @@ function scorePruningCandidates(topics) {
   // Count active (non-orphan) topics for recency calculation
   const activeTopics = topics.filter(t => !t.isOrphan);
   const activeCount = activeTopics.length;
+  // Pre-build index map to avoid O(n²) indexOf inside the map loop
+  const activeIndexMap = new Map(activeTopics.map((t, i) => [t, i]));
 
   return topics.map((t, idx) => {
     let score = 0;
@@ -301,7 +328,7 @@ function scorePruningCandidates(topics) {
     // active topics get a penalty (lower prune score), older topics get a
     // bonus. The first topic (initial context) is protected too.
     if (!t.isOrphan && activeCount > 4) {
-      const activeIdx = activeTopics.indexOf(t);
+      const activeIdx = activeIndexMap.get(t) ?? -1;
       const position = activeIdx / (activeCount - 1); // 0.0 = oldest, 1.0 = newest
       if (activeIdx === 0) {
         // First topic (initial context) — protect it
@@ -515,26 +542,15 @@ function guardInflight(entries) {
   const issues = [];
 
   // Exclude pending calls to our own MCP server — the runtime batches tool
-  // results and may not have flushed earlier read-only calls (get_context_stats,
-  // list_topics, get_topic_content) by the time a write call arrives. These are
-  // safe to ignore. We still block on non-MCP tools (Bash, Read, Agent, etc.)
-  // and on subagents/background tasks.
-  const OUR_TOOLS = new Set([
-    'mcp__context-manager__get_context_stats', 'mcp__context-manager__list_topics',
-    'mcp__context-manager__get_topic_content', 'mcp__context-manager__list_backups',
-    'mcp__context-manager__bypass_topic', 'mcp__context-manager__restore_topic',
-    'mcp__context-manager__summarize_topic', 'mcp__context-manager__prepare_summary',
-    'mcp__context-manager__forget_prune',
-    'mcp__context-manager__branch_session', 'mcp__context-manager__merge_future',
-    'mcp__context-manager__restore_backup'
-  ]);
+  // results and may not have flushed earlier read-only calls by the time a
+  // write call arrives. Match by prefix instead of a hardcoded set.
+  const isOurTool = (name) => name?.startsWith('mcp__context-manager__');
   const externalPending = [...pendingTools].filter(id => {
-    // Find the tool name for this pending ID
     for (const entry of activeEntries) {
       if (!entry.message?.content) continue;
       for (const block of entry.message.content) {
         if (block.type === 'tool_use' && block.id === id) {
-          return !OUR_TOOLS.has(block.name);
+          return !isOurTool(block.name);
         }
       }
     }
@@ -556,6 +572,23 @@ function guardInflight(entries) {
            `Wait for all background work to complete before pruning.`;
   }
   return null;
+}
+
+/**
+ * Find a topic by ID, supporting short prefix matching (min 8 chars).
+ * Returns { topic } or { error } if not found or ambiguous.
+ */
+function findTopicById(topics, topicId) {
+  if (!topicId) return { error: 'topic_id is required.' };
+  // Exact match first
+  const exact = topics.find(t => t.id === topicId);
+  if (exact) return { topic: exact };
+  // Prefix match (min 8 chars to avoid ambiguity)
+  if (topicId.length < 8) return { error: `topic_id prefix too short (${topicId.length} chars). Provide at least 8 characters.` };
+  const matches = topics.filter(t => t.id && t.id.startsWith(topicId));
+  if (matches.length === 0) return { error: `Topic ID ${topicId} not found.` };
+  if (matches.length > 1) return { error: `Ambiguous topic_id prefix "${topicId}" matches ${matches.length} topics. Provide a longer prefix.` };
+  return { topic: matches[0] };
 }
 
 // --- Helper: wrap tool handler with error text response ---
@@ -714,6 +747,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return textResult("Error: No session path. Provide session_path or ensure the stop hook has written .claude/session_path.txt.");
   }
 
+  const pathErr = validateSessionPath(filePath);
+  if (pathErr) return textResult(`Error: ${pathErr}`);
+
   const toolName = request.params.name;
 
   if (toolName === "list_topics") {
@@ -822,8 +858,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const inflightErr = guardInflight(entries);
     if (inflightErr) return textResult(inflightErr);
     const topics = getTopics(entries);
-    const topic = topics.find(t => t.id && (t.id === args.topic_id || t.id.startsWith(args.topic_id)));
-    if (!topic) return textResult(`Topic ID ${args.topic_id} not found.`);
+    const { topic, error: topicErr } = findTopicById(topics, args.topic_id);
+    if (topicErr) return textResult(topicErr);
 
     const result = bypassTopic(entries, topic);
     const writeResult = safeWriteHistory(filePath, result);
@@ -836,8 +872,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const inflightErr = guardInflight(entries);
     if (inflightErr) return textResult(inflightErr);
     const topics = getTopics(entries);
-    let topic = topics.find(t => t.id && (t.id === args.topic_id || t.id.startsWith(args.topic_id)));
-    if (!topic) return textResult(`Topic ID ${args.topic_id} not found.`);
+    let { topic, error: topicErr } = findTopicById(topics, args.topic_id);
+    if (topicErr) return textResult(topicErr);
 
     // If the user selected a summary topic (active, starts with '[SUMMARY of'),
     // find the original orphaned topic it replaced and restore that instead.
@@ -944,8 +980,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (toolName === "get_topic_content") {
     const entries = readHistory(filePath);
     const topics = getTopics(entries);
-    const topic = topics.find(t => t.id && (t.id === args.topic_id || t.id.startsWith(args.topic_id)));
-    if (!topic) return textResult(`Topic ID ${args.topic_id} not found.`);
+    const { topic, error: topicErr } = findTopicById(topics, args.topic_id);
+    if (topicErr) return textResult(topicErr);
 
     // Collect all text content from the topic's actual entries
     const uuids = new Set(topic.messages.map(m => m.uuid));
@@ -978,8 +1014,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (toolName === "prepare_summary") {
     const entries = readHistory(filePath);
     const topics = getTopics(entries);
-    const topic = topics.find(t => t.id && (t.id === args.topic_id || t.id.startsWith(args.topic_id)));
-    if (!topic) return textResult(`Topic ID ${args.topic_id} not found.`);
+    const { topic, error: topicErr } = findTopicById(topics, args.topic_id);
+    if (topicErr) return textResult(topicErr);
 
     // Check if a dormant summary already exists
     const existing = findDormantSummary(entries, topic.id);
@@ -1001,8 +1037,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const inflightErr = guardInflight(entries);
     if (inflightErr) return textResult(inflightErr);
     const topics = getTopics(entries);
-    const topic = topics.find(t => t.id && (t.id === args.topic_id || t.id.startsWith(args.topic_id)));
-    if (!topic) return textResult(`Topic ID ${args.topic_id} not found.`);
+    const { topic, error: topicErr } = findTopicById(topics, args.topic_id);
+    if (topicErr) return textResult(topicErr);
 
     // Check for existing dormant summary
     const dormant = findDormantSummary(entries, topic.id);
@@ -1038,11 +1074,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!args.after_uuid) return textResult("after_uuid is required.");
 
     // Find the anchor message (the last one to keep)
+    if (args.after_uuid && args.after_uuid.length < 8) {
+      return textResult(`after_uuid prefix too short (${args.after_uuid.length} chars). Provide at least 8 characters.`);
+    }
     const uuidMap = buildUuidMap(entries);
-    const anchor = [...uuidMap.values()].find(
+    const matches = [...uuidMap.values()].filter(
       e => e.uuid && (e.uuid === args.after_uuid || e.uuid.startsWith(args.after_uuid))
     );
-    if (!anchor) return textResult(`UUID ${args.after_uuid} not found in session.`);
+    if (matches.length === 0) return textResult(`UUID ${args.after_uuid} not found in session.`);
+    if (matches.length > 1) return textResult(`Ambiguous UUID prefix "${args.after_uuid}" matches ${matches.length} entries.`);
+    const anchor = matches[0];
 
     // Walk the active chain from the true tail back to the anchor, collecting everything after it
     const tail = findActiveTail(entries);
@@ -1115,6 +1156,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (toolName === "restore_backup") {
     if (!args.backup_name) return textResult("backup_name is required.");
+    if (args.backup_name.includes('/') || args.backup_name.includes('\\') || args.backup_name.includes('..')) {
+      return textResult("Invalid backup name — must not contain path separators or '..'.");
+    }
 
     const backupPath = path.join(BACKUP_DIR, args.backup_name);
     if (!fs.existsSync(backupPath)) return textResult(`Backup not found: ${args.backup_name}`);
