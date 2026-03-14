@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/stop.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__context-manager__bypass_topic",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__restore_topic",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__summarize_topic",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__branch_session",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__merge_future",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__forget_prune",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__restore_backup",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/pre-backup.js" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__context-manager__forget_prune",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/post-forget-prune.js" }]
+      },
+      {
+        "matcher": "mcp__context-manager__branch_session",
+        "hooks": [{ "type": "command", "command": "node .claude/hooks/post-forget-prune.js" }]
+      }
+    ]
+  }
+}

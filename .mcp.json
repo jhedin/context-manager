@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "context-manager": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["context-mcp.js"]
+    }
+  }
+}

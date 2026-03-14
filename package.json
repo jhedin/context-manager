@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc --noEmit",
+    "test": "node test_suite_bypass.js"
   },
   "keywords": [],
   "author": "",
@@ -14,10 +15,7 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-code": "^2.1.75",
     "@types/node": "^25.5.0",
-    "enquirer": "^2.4.1",
-    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
 }
