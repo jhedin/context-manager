@@ -154,9 +154,10 @@ function findActiveTail(history) {
   for (const e of history) {
     if (e.parentUuid) childCount.set(e.parentUuid, (childCount.get(e.parentUuid) || 0) + 1);
   }
-  // Walk backwards — first entry with a uuid and no children is the tail
+  // Walk backwards — first entry with a uuid, no children, and not a dormant
+  // summary (which has parentUuid: null and sits outside the active chain).
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].uuid && !childCount.has(history[i].uuid)) return history[i];
+    if (history[i].uuid && !childCount.has(history[i].uuid) && !history[i].dormantSummaryFor) return history[i];
   }
   return history[history.length - 1]; // fallback
 }
@@ -228,6 +229,10 @@ function getTopics(history) {
   };
 
   history.forEach((entry, idx) => {
+    // Skip dormant summary entries — they're pre-built summaries sitting
+    // outside the chain, not real conversation content.
+    if (entry.dormantSummaryFor) return;
+
     const text = getTextContent(entry);
     const isTopicShift = text.toLowerCase().startsWith('now ') ||
                          text.toLowerCase().startsWith('next ') ||
