@@ -275,12 +275,16 @@ test('createDormantSummary appends without affecting chain', () => {
   const topic = topics.find(t => t.name.includes('work'));
 
   const result = createDormantSummary(entries, topic, 'Summary text');
-  assert.strictEqual(result.length, entries.length + 1);
+  // Now creates 2 entries (assistant + result pair)
+  assert.strictEqual(result.length, entries.length + 2);
   assertChainLength(result, chainBefore, 'after dormant create');
 
-  const dormant = result[result.length - 1];
-  assert.strictEqual(dormant.dormantSummaryFor, topic.id);
-  assert.strictEqual(dormant.parentUuid, null);
+  const assistantEntry = result[result.length - 2];
+  const resultEntry = result[result.length - 1];
+  assert.strictEqual(assistantEntry.dormantSummaryFor, topic.id);
+  assert.strictEqual(assistantEntry.parentUuid, null);
+  assert.strictEqual(resultEntry.dormantSummaryFor, topic.id);
+  assert.strictEqual(resultEntry.parentUuid, assistantEntry.uuid);
 });
 
 test('findDormantSummary finds by exact ID', () => {
@@ -291,28 +295,33 @@ test('findDormantSummary finds by exact ID', () => {
   const withDormant = createDormantSummary(entries, topic, 'test');
   const found = findDormantSummary(withDormant, topic.id);
   assert(found, 'should find dormant');
-  assert.strictEqual(found.dormantSummaryFor, topic.id);
+  assert(found.assistantEntry, 'should have assistantEntry');
+  assert.strictEqual(found.assistantEntry.dormantSummaryFor, topic.id);
+  assert(found.resultEntry, 'should have resultEntry');
 });
 
-test('findDormantSummary returns undefined when none exists', () => {
+test('findDormantSummary returns null when none exists', () => {
   const entries = makeChain(['start', 'Now work']);
   const found = findDormantSummary(entries, 'nonexistent');
-  assert.strictEqual(found, undefined);
+  assert.strictEqual(found, null);
 });
 
-test('activateSummary links dormant into chain', () => {
+test('activateSummary links dormant pair into chain', () => {
   const entries = makeChain(['start', 'Now work', 'w1', 'Now after', 'a1']);
   const topics = getTopics(entries);
   const topic = topics.find(t => t.name.includes('work'));
 
   const withDormant = createDormantSummary(entries, topic, 'Summary');
-  const dormant = withDormant[withDormant.length - 1];
+  const resultEntry = withDormant[withDormant.length - 1];
+  const assistantEntry = withDormant[withDormant.length - 2];
+  const dormantPair = { assistantEntry, resultEntry };
 
-  const activated = activateSummary(withDormant, topic, dormant);
+  const activated = activateSummary(withDormant, topic, dormantPair);
   const activeAfter = getActiveChainUuids(activated);
 
-  // Dormant should be in chain now
-  assert(activeAfter.has(dormant.uuid), 'dormant should be in active chain');
+  // Both pair entries should be in chain now
+  assert(activeAfter.has(assistantEntry.uuid), 'assistant entry should be in active chain');
+  assert(activeAfter.has(resultEntry.uuid), 'result entry should be in active chain');
   // Topic messages should be orphaned
   assert(!activeAfter.has(topic.id), 'topic first msg should be orphaned');
   assertNoOrphans(activated, 'after activate');
@@ -325,7 +334,8 @@ test('summarizeTopic uses dormant if available', () => {
 
   // Pre-create dormant
   const withDormant = createDormantSummary(entries, topic, 'Pre-built summary');
-  const dormantUuid = withDormant[withDormant.length - 1].uuid;
+  const resultEntryUuid = withDormant[withDormant.length - 1].uuid;
+  const assistantEntryUuid = withDormant[withDormant.length - 2].uuid;
 
   // summarizeTopic should activate the dormant, not create a new one
   const topics2 = getTopics(withDormant);
@@ -333,7 +343,8 @@ test('summarizeTopic uses dormant if available', () => {
   const result = summarizeTopic(withDormant, topic2, 'This text should be ignored');
 
   const activeAfter = getActiveChainUuids(result);
-  assert(activeAfter.has(dormantUuid), 'should activate existing dormant');
+  assert(activeAfter.has(assistantEntryUuid), 'assistant entry should be active');
+  assert(activeAfter.has(resultEntryUuid), 'result entry should be active');
   assertNoOrphans(result, 'after summarize with dormant');
 });
 
@@ -343,15 +354,15 @@ test('summarizeTopic creates inline when no dormant', () => {
   const topic = topics.find(t => t.name.includes('work'));
 
   const result = summarizeTopic(entries, topic, 'Inline summary');
-  assert.strictEqual(result.length, entries.length + 1); // +1 for new summary entry
+  assert.strictEqual(result.length, entries.length + 2); // +2 for subagent pair
   assertNoOrphans(result, 'after inline summarize');
-  // Summary should be in chain
-  const summaryEntry = result.find(e =>
-    e.message?.content?.some(b => b.text?.includes('Inline summary'))
+  // Result entry (tail of pair) should be in chain
+  const resultEntry = result.find(e =>
+    e.message?.content?.some(b => b.type === 'tool_result' && typeof b.content === 'string' && b.content.includes('Inline summary'))
   );
-  assert(summaryEntry, 'summary entry should exist');
+  assert(resultEntry, 'result entry should exist');
   const active = getActiveChainUuids(result);
-  assert(active.has(summaryEntry.uuid), 'summary should be in active chain');
+  assert(active.has(resultEntry.uuid), 'result entry should be in active chain');
 });
 
 // =============================================================================

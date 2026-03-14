@@ -2,6 +2,7 @@ const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const fs = require('fs');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const server = new Server(
   { name: "context-manager-mcp", version: "3.0.0" },
@@ -348,8 +349,10 @@ function scorePruningCandidates(topics) {
     if (t.isOrphan) score = 0;
 
     // Summary topics are already condensed — don't recommend pruning them further
-    const firstText = t.messages[0]?.text || '';
-    if (firstText.startsWith('[SUMMARY of')) score = 0;
+    const firstMsg = t.messages[0];
+    const firstText = firstMsg?.text || '';
+    const isSummaryPair = firstMsg?.message?.content?.some(b => b.type === 'tool_use' && b.name === 'Agent');
+    if (firstText.startsWith('[SUMMARY of') || isSummaryPair) score = 0;
 
     return { ...t, pruneScore: Math.round(score), estimatedTokens };
   });
@@ -402,39 +405,49 @@ function restoreTopic(history, topic) {
     return { error: `Topic "${topic.name}" is not orphaned — nothing to restore.` };
   }
 
-  // Check if there's a summary entry that replaced this topic.
-  // A summary has parentUuid == grandparent, is type 'assistant', and contains '[SUMMARY of'.
-  // The summary may have been grouped INTO this topic by getTopics, so search
-  // both inside and outside the topic message list.
-  const isSummaryEntry = (e) =>
+  // Check if a summary pair replaced this topic. The summary assistant entry
+  // has parentUuid == grandparent and a tool_use block with name 'Agent'.
+  // The result entry is parented to the assistant entry and has a tool_result.
+  // Legacy summaries (pre-pair) had a text block containing '[SUMMARY of'.
+  const summaryAssistant = history.find(e =>
     e.parentUuid === grandparentUuid &&
-    e.message?.content?.some(b => b.type === 'text' && b.text?.includes('[SUMMARY of'));
+    e.message?.content?.some(b =>
+      (b.type === 'tool_use' && b.name === 'Agent') ||
+      (b.type === 'text' && b.text?.includes('[SUMMARY of'))
+    )
+  );
+  const summaryResult = summaryAssistant
+    ? history.find(e => e.parentUuid === summaryAssistant.uuid &&
+        e.message?.content?.some(b => b.type === 'tool_result'))
+    : null;
+  // The tail of the summary pair: downstream entry points here
+  const summaryTail = summaryResult || summaryAssistant;
 
-  const summaryEntry = history.find(isSummaryEntry);
-
-  // Filter out the summary from topic messages — it was inserted by summarizeTopic
-  // and getTopics may have grouped it into the same topic. The "real" topic messages
-  // are everything except the summary.
-  const realMessages = topic.messages.filter(m => !summaryEntry || m.uuid !== summaryEntry.uuid);
+  // Filter out the summary entries from topic messages (getTopics may have grouped them in)
+  const summaryUuids = new Set([summaryAssistant?.uuid, summaryResult?.uuid].filter(Boolean));
+  const realMessages = topic.messages.filter(m => !summaryUuids.has(m.uuid));
   const topicUuids = new Set(realMessages.map(m => m.uuid));
   const firstMsg = realMessages[0];
   const lastMsg = realMessages[realMessages.length - 1];
 
-  Sidecar.log('RESTORE', { topic: topic.name, lastMsgUuid: lastMsg.uuid, grandparentUuid, hadSummary: !!summaryEntry });
+  Sidecar.log('RESTORE', { topic: topic.name, lastMsgUuid: lastMsg.uuid, grandparentUuid, hadSummary: !!summaryAssistant });
 
   return history.map(entry => {
-    // If this is the summary entry, orphan it by pointing to nothing useful
-    // (keep it in the file but disconnect it from the active chain)
-    if (summaryEntry && entry.uuid === summaryEntry.uuid) {
+    // Orphan the summary assistant entry
+    if (summaryAssistant && entry.uuid === summaryAssistant.uuid) {
       return { ...entry, parentUuid: null, isSidechain: true };
     }
+    // Orphan the summary result entry (keep its parentUuid pointing to assistant so it stays grouped)
+    if (summaryResult && entry.uuid === summaryResult.uuid) {
+      return { ...entry, isSidechain: true };
+    }
     // Find the entry that was reparented to skip this topic.
-    // For bypass: it points to grandparent. For summarize: it points to the summary.
+    // For bypass: it points to grandparent. For summarize: it points to summary tail.
     // Either way, point it back to the topic's last message.
-    if (entry.parentUuid === grandparentUuid && !topicUuids.has(entry.uuid) && entry.uuid !== summaryEntry?.uuid) {
+    if (entry.parentUuid === grandparentUuid && !topicUuids.has(entry.uuid) && !summaryUuids.has(entry.uuid)) {
       return { ...entry, parentUuid: lastMsg.uuid };
     }
-    if (summaryEntry && entry.parentUuid === summaryEntry.uuid && !topicUuids.has(entry.uuid)) {
+    if (summaryTail && entry.parentUuid === summaryTail.uuid && !topicUuids.has(entry.uuid) && !summaryUuids.has(entry.uuid)) {
       return { ...entry, parentUuid: lastMsg.uuid };
     }
     return entry;
@@ -442,81 +455,142 @@ function restoreTopic(history, topic) {
 }
 
 /**
- * Create a dormant summary entry — appended to the file but NOT linked into
- * the active chain. It has parentUuid: null and a dormantSummaryFor field
- * pointing to the original topic's first-message UUID.
+ * Create a dormant summary as a subagent pair — two entries appended to the
+ * file but NOT linked into the active chain. Both have parentUuid: null and
+ * dormantSummaryFor pointing to the original topic's first-message UUID.
  *
- * Returns the new history array with the dormant entry appended.
+ * Entry 1 (assistant): tool_use block simulating an Agent call to a summarizer subagent.
+ * Entry 2 (user): tool_result block with the summary text, parented to entry 1.
+ *
+ * When activated, entry 1 is linked to the topic's grandparent, entry 2 to entry 1,
+ * and the downstream chain entry is reparented to entry 2.
+ *
+ * Returns the new history array with both dormant entries appended.
  */
 function createDormantSummary(history, topic, summaryText) {
   const { v4: uuidv4 } = require('uuid');
   const topicUuids = new Set(topic.messages.map(m => m.uuid));
   const templateEntry = history.find(e => topicUuids.has(e.uuid)) || history[0];
+  const toolUseId = `toolu_summary_${uuidv4().replace(/-/g, '').substring(0, 20)}`;
+  const assistantUuid = uuidv4();
+  const resultUuid = uuidv4();
+  const now = new Date().toISOString();
 
-  const dormantEntry = {
-    uuid: uuidv4(),
+  // Entry 1: assistant tool_use (appears as subagent dispatch in UI)
+  const assistantEntry = {
+    uuid: assistantUuid,
     parentUuid: null,
-    dormantSummaryFor: topic.id,  // links to original topic's first-message UUID
+    dormantSummaryFor: topic.id,
     type: 'assistant',
     sessionId: templateEntry.sessionId,
-    timestamp: new Date().toISOString(),
+    timestamp: now,
     cwd: templateEntry.cwd,
     version: templateEntry.version,
     message: {
       role: 'assistant',
-      content: [{ type: 'text', text: `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}` }]
+      content: [{
+        type: 'tool_use',
+        id: toolUseId,
+        name: 'Agent',
+        input: {
+          description: `Summarize topic: ${topic.name}`,
+          subagent_type: 'summarizer'
+        }
+      }]
     }
   };
 
-  Sidecar.log('DORMANT_SUMMARY', { topic: topic.name, topicId: topic.id, summaryUuid: dormantEntry.uuid });
+  // Entry 2: user tool_result (contains the actual summary text)
+  const resultEntry = {
+    uuid: resultUuid,
+    parentUuid: assistantUuid,  // chained to assistant entry
+    dormantSummaryFor: topic.id,
+    type: 'user',
+    sessionId: templateEntry.sessionId,
+    timestamp: now,
+    cwd: templateEntry.cwd,
+    version: templateEntry.version,
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}`
+      }]
+    }
+  };
 
-  return [...history, dormantEntry];
+  Sidecar.log('DORMANT_SUMMARY', { topic: topic.name, topicId: topic.id, assistantUuid, resultUuid });
+
+  return [...history, assistantEntry, resultEntry];
 }
 
 /**
- * Find an existing dormant summary for a topic, if one exists.
+ * Find an existing dormant summary for a topic.
+ * Returns { assistantEntry, resultEntry } or null.
+ * The assistant entry has role='assistant' with a tool_use block.
+ * The result entry has role='user' with a tool_result block containing the summary text.
  */
 function findDormantSummary(history, topicId) {
-  return history.find(e =>
+  const matchesTopicId = (e) =>
     e.dormantSummaryFor === topicId ||
-    (e.dormantSummaryFor && topicId && topicId.startsWith(e.dormantSummaryFor))
+    (e.dormantSummaryFor && topicId && topicId.startsWith(e.dormantSummaryFor));
+
+  const assistantEntry = history.find(e => matchesTopicId(e) && e.message?.role === 'assistant');
+  if (!assistantEntry) return null;
+
+  // Find the paired result entry (parented to the assistant entry)
+  const resultEntry = history.find(e =>
+    matchesTopicId(e) && e.message?.role === 'user' && e.parentUuid === assistantEntry.uuid
   );
+
+  return { assistantEntry, resultEntry: resultEntry || null };
 }
 
 /**
- * Activate a dormant summary — link it into the chain in place of the topic.
- * The dormant entry gets parentUuid set to the topic's grandparent, and the
- * downstream entry gets reparented to the summary. dormantSummaryFor is cleared.
+ * Activate a dormant summary pair — link both entries into the chain in place
+ * of the topic. The assistant entry is linked to the topic's grandparent,
+ * the result entry to the assistant entry, and the downstream chain entry
+ * is reparented to the result entry (or assistant entry if no result entry).
  */
-function activateSummary(history, topic, dormantEntry) {
+function activateSummary(history, topic, dormantPair) {
+  const { assistantEntry, resultEntry } = dormantPair;
   const topicUuids = new Set(topic.messages.map(m => m.uuid));
   const grandparentUuid = topic.messages[0].parentUuid;
   const lastMsgUuid = topic.messages[topic.messages.length - 1].uuid;
+  // Downstream entries reparent to the tail of the summary pair
+  const summaryTailUuid = resultEntry ? resultEntry.uuid : assistantEntry.uuid;
 
   Sidecar.log('ACTIVATE_SUMMARY', {
     topic: topic.name,
     topicId: topic.id,
-    summaryUuid: dormantEntry.uuid,
+    assistantUuid: assistantEntry.uuid,
+    resultUuid: resultEntry?.uuid,
     reParentedTo: grandparentUuid
   });
 
   return history.map(entry => {
-    // Activate the dormant entry: link it into the chain
-    if (entry.uuid === dormantEntry.uuid) {
+    // Activate the assistant entry: link it into the chain at grandparent
+    if (entry.uuid === assistantEntry.uuid) {
       const { dormantSummaryFor, ...rest } = entry;
       return { ...rest, parentUuid: grandparentUuid };
     }
-    // Reparent the downstream entry from topic's last message to the summary
+    // Activate the result entry: link it to the assistant entry (already set, just clear dormant flag)
+    if (resultEntry && entry.uuid === resultEntry.uuid) {
+      const { dormantSummaryFor, ...rest } = entry;
+      return rest;
+    }
+    // Reparent the downstream entry from topic's last message to the summary tail
     if (entry.parentUuid === lastMsgUuid && !topicUuids.has(entry.uuid)) {
-      return { ...entry, parentUuid: dormantEntry.uuid };
+      return { ...entry, parentUuid: summaryTailUuid };
     }
     return entry;
   });
 }
 
 /**
- * Replace a topic's messages with a single synthetic summary message.
- * If a dormant summary exists, activates it. Otherwise creates one inline.
+ * Replace a topic's messages with a dormant summary pair.
+ * If a dormant pair already exists, activates it. Otherwise creates one inline.
  */
 function summarizeTopic(history, topic, summaryText) {
   // Check for an existing dormant summary
@@ -525,10 +599,12 @@ function summarizeTopic(history, topic, summaryText) {
     return activateSummary(history, topic, dormant);
   }
 
-  // No dormant summary — create one and activate it immediately
+  // No dormant summary — create and activate immediately
   const withDormant = createDormantSummary(history, topic, summaryText);
-  const newDormant = withDormant[withDormant.length - 1]; // just appended
-  return activateSummary(withDormant, topic, newDormant);
+  // Two entries were appended; assistant is second-to-last, result is last
+  const resultEntry = withDormant[withDormant.length - 1];
+  const assistantEntry = withDormant[withDormant.length - 2];
+  return activateSummary(withDormant, topic, { assistantEntry, resultEntry });
 }
 
 // --- Safety gate: refuse writes if async work is in-flight ---
@@ -591,6 +667,54 @@ function findTopicById(topics, topicId) {
   if (matches.length === 0) return { error: `Topic ID ${topicId} not found.` };
   if (matches.length > 1) return { error: `Ambiguous topic_id prefix "${topicId}" matches ${matches.length} topics. Provide a longer prefix.` };
   return { topic: matches[0] };
+}
+
+// --- API-powered summarization ---
+
+/**
+ * Extract readable text content from a topic's entries for summarization.
+ */
+function extractTopicContent(entries, topic) {
+  const uuids = new Set(topic.messages.map(m => m.uuid));
+  const parts = [];
+  for (const entry of entries) {
+    if (!uuids.has(entry.uuid) || !entry.message?.content) continue;
+    const role = entry.message.role || entry.type;
+    for (const block of entry.message.content) {
+      if (block.type === 'text' && block.text) {
+        parts.push(`[${role}] ${block.text.substring(0, 2000)}`);
+      } else if (block.type === 'tool_use') {
+        parts.push(`[tool_use: ${block.name}]`);
+      } else if (block.type === 'tool_result') {
+        const preview = typeof block.content === 'string'
+          ? block.content.substring(0, 500)
+          : JSON.stringify(block.content).substring(0, 500);
+        parts.push(`[tool_result] ${preview}`);
+      }
+    }
+  }
+  return parts.join('\n\n');
+}
+
+/**
+ * Call claude-opus-4-6 via the Anthropic API to generate a summary.
+ * Returns the summary text, or null if ANTHROPIC_API_KEY is not set.
+ */
+async function generateSummaryWithAPI(topicContent, topicName, messageCount) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+
+  const client = new Anthropic();
+  const response = await client.messages.create({
+    model: 'claude-opus-4-6',
+    max_tokens: 512,
+    system: 'You are a session historian. Write concise summaries of conversation topics for context compression. Focus on decisions, outcomes, and final state. Skip debugging iterations and intermediate tool output. 2-4 sentences maximum.',
+    messages: [{
+      role: 'user',
+      content: `Summarize this conversation topic "${topicName}" (${messageCount} messages) in 2-4 sentences. Focus on what was decided or changed, the final state of any files modified, and key outcomes.\n\n${topicContent}`
+    }]
+  });
+
+  return response.content.find(b => b.type === 'text')?.text || null;
 }
 
 // --- Helper: wrap tool handler with error text response ---
@@ -669,7 +793,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "summarize_topic",
-      description: "Replace a topic's messages with a single summary message. If a dormant summary already exists for this topic (created by prepare_summary), it is activated instantly without needing the summary parameter. Otherwise, Claude should first call get_topic_content, write a summary, then call this with that summary text.",
+      description: "Replace a topic's messages with a subagent summary pair. If a dormant summary already exists (created by prepare_summary), it is activated instantly. Otherwise, claude-opus-4-6 is called automatically via the Anthropic API to generate the summary (requires ANTHROPIC_API_KEY). You may also pass a summary parameter to override auto-generation.",
       inputSchema: {
         type: "object",
         properties: {
@@ -682,15 +806,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "prepare_summary",
-      description: "Pre-generate a dormant summary for a topic. The summary is appended to the file but NOT linked into the active chain. When summarize_topic is later called for this topic, the dormant summary is activated instantly. Use this to batch-prepare summaries upfront so pruning becomes a fast reparent operation.",
+      description: "Pre-generate a dormant summary for a topic using claude-opus-4-6 (requires ANTHROPIC_API_KEY). The summary is appended to the file but NOT linked into the active chain. When summarize_topic is later called for this topic, the dormant summary is activated instantly without another LLM call.",
       inputSchema: {
         type: "object",
         properties: {
           topic_id: { type: "string", description: "Topic UUID from list_topics" },
-          summary: { type: "string", description: "The summary text that Claude generated from get_topic_content" },
+          summary: { type: "string", description: "Optional: override the auto-generated summary text" },
           session_path: { type: "string" }
         },
-        required: ["topic_id", "summary"]
+        required: ["topic_id"]
       }
     },
     {
@@ -1009,7 +1133,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return textResult(
       `Topic "${topic.name}" (${topic.messages.length} messages, ~${topic.estimatedTokens || '?'} tokens):\n\n` +
       contentParts.join('\n\n') +
-      `\n\nNow write a concise summary of the key decisions, outcomes, and state changes from this topic. Then call summarize_topic with your summary.`
+      `\n\nYou may now call summarize_topic with this topic_id — it will auto-generate a summary via claude-opus-4-6. Or pass a summary parameter to override.`
     );
   }
 
@@ -1022,14 +1146,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Check if a dormant summary already exists
     const existing = findDormantSummary(entries, topic.id);
     if (existing) {
-      return textResult(`Dormant summary already exists for "${topic.name}" (${existing.uuid.substring(0, 8)}).`);
+      return textResult(`Dormant summary already exists for "${topic.name}" (${existing.assistantEntry.uuid.substring(0, 8)}).`);
     }
 
-    const result = createDormantSummary(entries, topic, args.summary);
+    // Use API to generate summary, or fall back to caller-provided text
+    let summaryText = args.summary;
+    if (!summaryText) {
+      const content = extractTopicContent(entries, topic);
+      const apiSummary = await generateSummaryWithAPI(content, topic.name, topic.messages.length);
+      if (apiSummary) {
+        summaryText = apiSummary;
+      } else {
+        return textResult(`No ANTHROPIC_API_KEY set and no summary provided. Either set ANTHROPIC_API_KEY or pass a summary parameter.`);
+      }
+    }
+
+    const result = createDormantSummary(entries, topic, summaryText);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(
-      `Prepared dormant summary for "${topic.name}" (${topic.messages.length} msgs). ` +
+      `Prepared dormant summary for "${topic.name}" (${topic.messages.length} msgs) using claude-opus-4-6. ` +
       `Call summarize_topic to activate it.`
     );
   }
@@ -1054,16 +1190,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
     }
 
-    // No dormant summary — need summary text
-    if (!args.summary) {
-      return textResult(`No dormant summary exists for "${topic.name}". Provide a summary parameter, or call prepare_summary first.`);
+    // No dormant summary — generate via API or use caller-provided text
+    let summaryText = args.summary;
+    if (!summaryText) {
+      const content = extractTopicContent(entries, topic);
+      const apiSummary = await generateSummaryWithAPI(content, topic.name, topic.messages.length);
+      if (apiSummary) {
+        summaryText = apiSummary;
+      } else {
+        return textResult(`No dormant summary exists for "${topic.name}". Set ANTHROPIC_API_KEY for auto-summarization, or provide a summary parameter.`);
+      }
     }
 
-    const result = summarizeTopic(entries, topic, args.summary);
+    const result = summarizeTopic(entries, topic, summaryText);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(
-      `Summarized "${topic.name}": replaced ${topic.messages.length} messages with 1 summary message. ` +
+      `Summarized "${topic.name}": replaced ${topic.messages.length} messages with a subagent summary pair. ` +
       `Type /resume to reload with summarized history.`
     );
   }
@@ -1219,7 +1362,7 @@ if (typeof module !== 'undefined') {
     analyzeEntry, getTopics, scorePruningCandidates, checkForInflightWork,
     bypassTopic, restoreTopic, createDormantSummary, findDormantSummary,
     activateSummary, summarizeTopic, findTopicById, validateSessionPath,
-    guardInflight, readHistory, safeWriteHistory
+    guardInflight, readHistory, safeWriteHistory, extractTopicContent
   };
 }
 
