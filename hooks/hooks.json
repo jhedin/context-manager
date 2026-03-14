@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/stop.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__context-manager__bypass_topic|mcp__context-manager__restore_topic|mcp__context-manager__summarize_topic|mcp__context-manager__branch_session|mcp__context-manager__merge_future|mcp__context-manager__forget_prune|mcp__context-manager__restore_backup|mcp__context-manager__prepare_summary",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/pre-backup.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__context-manager__forget_prune|mcp__context-manager__branch_session",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/post-forget-prune.js"
+          }
+        ]
+      }
+    ]
+  }
+}

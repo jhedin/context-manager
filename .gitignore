@@ -1,11 +1,12 @@
 node_modules/
 
-# Runtime artifacts
+# Runtime state (project-level, not plugin-level)
 .claude/backups/
 .claude/context_sidecar.json
 .claude/session_path.txt
 .claude/hooks/*.log
 .claude/pending_reparent.json
+.claude/auto_prune_state.json
 
 # Test fixtures
 test_session.jsonl
@@ -14,3 +15,10 @@ session_backup.jsonl
 # Dev scripts
 dump_hook.js
 self_resume.sh
+
+# Old non-plugin dev files
+geminithoughts.md
+v0_mermaid.py
+setup.sh
+test_*.js
+verify_chain.py

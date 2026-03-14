@@ -3,7 +3,7 @@
     "context-manager": {
       "type": "stdio",
       "command": "node",
-      "args": ["context-mcp.js"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/context-mcp.js"]
     }
   }
 }
