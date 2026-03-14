@@ -529,35 +529,34 @@ function createDormantSummary(history, topic, summaryText, sessionFilePath) {
     }
   };
 
-  // Write subagent sidecar files so Claude Code can drill into the summary
+  // Write subagent sidecar files: the topic's original entries become the
+  // subagent's session, so Claude Code can drill in and see the full history.
   if (sessionFilePath) {
     try {
       const sessionId = templateEntry.sessionId;
       const subagentDir = path.join(path.dirname(sessionFilePath), sessionId, 'subagents');
       fs.mkdirSync(subagentDir, { recursive: true });
 
-      const agentEntry = {
-        parentUuid: null,
-        isSidechain: true,
-        promptId,
+      // Copy topic entries verbatim, stamping each with agentId/promptId/isSidechain.
+      // Reset the first entry's parentUuid to null (it's now a root in the subagent file).
+      const topicEntries = history.filter(e => topicUuids.has(e.uuid));
+      const agentEntries = topicEntries.map((e, i) => ({
+        ...e,
         agentId,
-        sessionId,
-        type: 'user',
-        timestamp: now,
-        cwd: templateEntry.cwd,
-        version: templateEntry.version,
-        message: {
-          role: 'user',
-          content: `Summarize topic "${topic.name}" for context compression. Focus on decisions, outcomes, and final state of any files modified. 2-4 sentences.`
-        }
-      };
-      const agentResultEntry = {
-        parentUuid: uuidv4(),
-        isSidechain: true,
         promptId,
+        isSidechain: true,
+        ...(i === 0 ? { parentUuid: null } : {})
+      }));
+
+      // Append a final assistant entry with the summary text
+      const summaryEntry = {
+        uuid: uuidv4(),
+        parentUuid: agentEntries[agentEntries.length - 1]?.uuid ?? null,
         agentId,
-        sessionId,
+        promptId,
+        isSidechain: true,
         type: 'assistant',
+        sessionId,
         timestamp: now,
         cwd: templateEntry.cwd,
         version: templateEntry.version,
@@ -569,7 +568,7 @@ function createDormantSummary(history, topic, summaryText, sessionFilePath) {
         }
       };
 
-      const agentJsonl = [agentEntry, agentResultEntry].map(e => JSON.stringify(e)).join('\n') + '\n';
+      const agentJsonl = [...agentEntries, summaryEntry].map(e => JSON.stringify(e)).join('\n') + '\n';
       fs.writeFileSync(path.join(subagentDir, `agent-${agentId}.jsonl`), agentJsonl);
       fs.writeFileSync(path.join(subagentDir, `agent-${agentId}.meta.json`), JSON.stringify({ agentType: 'summarizer' }));
     } catch (e) {
