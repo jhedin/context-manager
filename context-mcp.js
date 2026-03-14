@@ -467,14 +467,18 @@ function restoreTopic(history, topic) {
  *
  * Returns the new history array with both dormant entries appended.
  */
-function createDormantSummary(history, topic, summaryText) {
+function createDormantSummary(history, topic, summaryText, sessionFilePath) {
   const { v4: uuidv4 } = require('uuid');
   const topicUuids = new Set(topic.messages.map(m => m.uuid));
   const templateEntry = history.find(e => topicUuids.has(e.uuid)) || history[0];
   const toolUseId = `toolu_summary_${uuidv4().replace(/-/g, '').substring(0, 20)}`;
   const assistantUuid = uuidv4();
   const resultUuid = uuidv4();
+  const agentId = uuidv4().replace(/-/g, '').substring(0, 17);
+  const promptId = uuidv4();
   const now = new Date().toISOString();
+
+  const summaryText_ = `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}`;
 
   // Entry 1: assistant tool_use (appears as subagent dispatch in UI)
   const assistantEntry = {
@@ -507,8 +511,9 @@ function createDormantSummary(history, topic, summaryText) {
   // Entry 2: user tool_result (contains the actual summary text)
   const resultEntry = {
     uuid: resultUuid,
-    parentUuid: assistantUuid,  // chained to assistant entry
+    parentUuid: assistantUuid,
     dormantSummaryFor: topic.id,
+    promptId,
     type: 'user',
     sessionId: templateEntry.sessionId,
     timestamp: now,
@@ -519,17 +524,60 @@ function createDormantSummary(history, topic, summaryText) {
       content: [{
         type: 'tool_result',
         tool_use_id: toolUseId,
-        // content must be an array of content blocks (not a plain string)
-        // so Claude Code renders it as a subagent result
-        content: [{
-          type: 'text',
-          text: `[SUMMARY of "${topic.name}" (original: ${topic.id}) — ${topic.messages.length} messages condensed]\n\n${summaryText}`
-        }]
+        content: [{ type: 'text', text: summaryText_ }]
       }]
     }
   };
 
-  Sidecar.log('DORMANT_SUMMARY', { topic: topic.name, topicId: topic.id, assistantUuid, resultUuid });
+  // Write subagent sidecar files so Claude Code can drill into the summary
+  if (sessionFilePath) {
+    try {
+      const sessionId = templateEntry.sessionId;
+      const subagentDir = path.join(path.dirname(sessionFilePath), sessionId, 'subagents');
+      fs.mkdirSync(subagentDir, { recursive: true });
+
+      const agentEntry = {
+        parentUuid: null,
+        isSidechain: true,
+        promptId,
+        agentId,
+        sessionId,
+        type: 'user',
+        timestamp: now,
+        cwd: templateEntry.cwd,
+        version: templateEntry.version,
+        message: {
+          role: 'user',
+          content: `Summarize topic "${topic.name}" for context compression. Focus on decisions, outcomes, and final state of any files modified. 2-4 sentences.`
+        }
+      };
+      const agentResultEntry = {
+        parentUuid: uuidv4(),
+        isSidechain: true,
+        promptId,
+        agentId,
+        sessionId,
+        type: 'assistant',
+        timestamp: now,
+        cwd: templateEntry.cwd,
+        version: templateEntry.version,
+        message: {
+          model: 'claude-opus-4-6',
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: summaryText_ }]
+        }
+      };
+
+      const agentJsonl = [agentEntry, agentResultEntry].map(e => JSON.stringify(e)).join('\n') + '\n';
+      fs.writeFileSync(path.join(subagentDir, `agent-${agentId}.jsonl`), agentJsonl);
+      fs.writeFileSync(path.join(subagentDir, `agent-${agentId}.meta.json`), JSON.stringify({ agentType: 'summarizer' }));
+    } catch (e) {
+      Sidecar.log('SUBAGENT_WRITE_ERROR', { error: e.message });
+    }
+  }
+
+  Sidecar.log('DORMANT_SUMMARY', { topic: topic.name, topicId: topic.id, assistantUuid, resultUuid, agentId });
 
   return [...history, assistantEntry, resultEntry];
 }
@@ -601,7 +649,7 @@ function activateSummary(history, topic, dormantPair) {
  * Replace a topic's messages with a dormant summary pair.
  * If a dormant pair already exists, activates it. Otherwise creates one inline.
  */
-function summarizeTopic(history, topic, summaryText) {
+function summarizeTopic(history, topic, summaryText, sessionFilePath) {
   // Check for an existing dormant summary
   const dormant = findDormantSummary(history, topic.id);
   if (dormant) {
@@ -609,7 +657,7 @@ function summarizeTopic(history, topic, summaryText) {
   }
 
   // No dormant summary — create and activate immediately
-  const withDormant = createDormantSummary(history, topic, summaryText);
+  const withDormant = createDormantSummary(history, topic, summaryText, sessionFilePath);
   // Two entries were appended; assistant is second-to-last, result is last
   const resultEntry = withDormant[withDormant.length - 1];
   const assistantEntry = withDormant[withDormant.length - 2];
@@ -1170,7 +1218,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
-    const result = createDormantSummary(entries, topic, summaryText);
+    const result = createDormantSummary(entries, topic, summaryText, filePath);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(
@@ -1211,7 +1259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
-    const result = summarizeTopic(entries, topic, summaryText);
+    const result = summarizeTopic(entries, topic, summaryText, filePath);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(
