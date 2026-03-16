@@ -10,7 +10,7 @@ claude plugins marketplace add https://github.com/jhedin/context-manager
 claude plugins install context-manager
 ```
 
-Restart Claude Code after installing to activate the hooks and MCP server.
+Restart Claude Code after installing. Dependencies are installed automatically on first use.
 
 To test locally without installing:
 ```bash
