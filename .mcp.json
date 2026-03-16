@@ -3,7 +3,12 @@
     "context-manager": {
       "type": "stdio",
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/context-mcp.js"]
+      "args": ["/home/jhedin/workspace/compacting/context-mcp.js"]
+    },
+    "harness": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/home/jhedin/workspace/compacting/harness-mcp.js"]
     }
   }
 }

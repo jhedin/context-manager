@@ -9,6 +9,15 @@
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/stop.js"
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/gardener.js"
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -29,6 +38,15 @@
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/post-forget-prune.js"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_compound-engineering_pw__browser_",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/post-playwright.js"
           }
         ]
       }

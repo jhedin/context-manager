@@ -2,7 +2,6 @@ const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const fs = require('fs');
-const Anthropic = require('@anthropic-ai/sdk');
 
 const server = new Server(
   { name: "context-manager-mcp", version: "3.0.0" },
@@ -467,14 +466,14 @@ function restoreTopic(history, topic) {
  *
  * Returns the new history array with both dormant entries appended.
  */
-function createDormantSummary(history, topic, summaryText, sessionFilePath) {
+function createDormantSummary(history, topic, summaryText, sessionFilePath, providedAgentId) {
   const { v4: uuidv4 } = require('uuid');
   const topicUuids = new Set(topic.messages.map(m => m.uuid));
   const templateEntry = history.find(e => topicUuids.has(e.uuid)) || history[0];
   const toolUseId = `toolu_summary_${uuidv4().replace(/-/g, '').substring(0, 20)}`;
   const assistantUuid = uuidv4();
   const resultUuid = uuidv4();
-  const agentId = uuidv4().replace(/-/g, '').substring(0, 17);
+  const agentId = providedAgentId || uuidv4().replace(/-/g, '').substring(0, 17);
   const promptId = uuidv4();
   const now = new Date().toISOString();
 
@@ -648,7 +647,7 @@ function activateSummary(history, topic, dormantPair) {
  * Replace a topic's messages with a dormant summary pair.
  * If a dormant pair already exists, activates it. Otherwise creates one inline.
  */
-function summarizeTopic(history, topic, summaryText, sessionFilePath) {
+function summarizeTopic(history, topic, summaryText, sessionFilePath, providedAgentId) {
   // Check for an existing dormant summary
   const dormant = findDormantSummary(history, topic.id);
   if (dormant) {
@@ -656,7 +655,7 @@ function summarizeTopic(history, topic, summaryText, sessionFilePath) {
   }
 
   // No dormant summary — create and activate immediately
-  const withDormant = createDormantSummary(history, topic, summaryText, sessionFilePath);
+  const withDormant = createDormantSummary(history, topic, summaryText, sessionFilePath, providedAgentId);
   // Two entries were appended; assistant is second-to-last, result is last
   const resultEntry = withDormant[withDormant.length - 1];
   const assistantEntry = withDormant[withDormant.length - 2];
@@ -753,24 +752,54 @@ function extractTopicContent(entries, topic) {
 }
 
 /**
- * Call claude-opus-4-6 via the Anthropic API to generate a summary.
- * Returns the summary text, or null if ANTHROPIC_API_KEY is not set.
+ * Call claude --print to generate a summary.
+ * Runs from os.tmpdir() so the session file doesn't appear in the current project.
  */
-async function generateSummaryWithAPI(topicContent, topicName, messageCount) {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
+async function generateSummaryWithAPI(topicContent, topicName, messageCount, agentId) {
+  const { spawnSync } = require('child_process');
+  const startMs = Date.now();
+  const prompt = `You completed the following conversation topic as a subagent. Write a completion report in the standard subagent format.
 
-  const client = new Anthropic();
-  const response = await client.messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 512,
-    system: 'You are a session historian. Write concise summaries of conversation topics for context compression. Focus on decisions, outcomes, and final state. Skip debugging iterations and intermediate tool output. 2-4 sentences maximum.',
-    messages: [{
-      role: 'user',
-      content: `Summarize this conversation topic "${topicName}" (${messageCount} messages) in 2-4 sentences. Focus on what was decided or changed, the final state of any files modified, and key outcomes.\n\n${topicContent}`
-    }]
+Topic: "${topicName}" (${messageCount} messages)
+
+Format your response exactly like this:
+## Summary
+[1-2 sentences: what was accomplished]
+
+## Key Outcomes
+- [bullet: decision, change, or result]
+- [bullet: ...]
+
+## Final State
+[1-2 sentences: current state of files/systems/data after the work, or "No persistent changes."]
+
+Rules:
+- Do not reproduce raw tool output, data blobs, or verbatim identifiers from tool results
+- Synthesize and compress — describe what happened, not what the data contained
+- Keep total response under 200 words
+
+---
+${topicContent}`;
+  const result = spawnSync('claude', [
+    '--print', prompt,
+    '--output-format', 'text',
+    '--model', 'claude-opus-4-6',
+  ], {
+    cwd: require('os').tmpdir(),
+    env: { ...process.env },
+    timeout: 60000,
+    encoding: 'utf8',
+    maxBuffer: 2 * 1024 * 1024,
   });
-
-  return response.content.find(b => b.type === 'text')?.text || null;
+  if (result.status !== 0 || !result.stdout?.trim()) {
+    throw new Error(result.stderr?.trim() || `claude --print exited with code ${result.status}`);
+  }
+  const summaryBody = result.stdout.trim();
+  const durationMs = Date.now() - startMs;
+  const footer = agentId
+    ? `\nagentId: ${agentId} (context compression summary)\n<usage>total_tokens: ${messageCount * 200}\ntool_uses: ${messageCount}\nduration_ms: ${durationMs}</usage>`
+    : '';
+  return summaryBody + footer;
 }
 
 // --- Helper: wrap tool handler with error text response ---
@@ -849,7 +878,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "summarize_topic",
-      description: "Replace a topic's messages with a subagent summary pair. If a dormant summary already exists (created by prepare_summary), it is activated instantly. Otherwise, claude-opus-4-6 is called automatically via the Anthropic API to generate the summary (requires ANTHROPIC_API_KEY). You may also pass a summary parameter to override auto-generation.",
+      description: "Replace a topic's messages with a subagent summary pair. If a dormant summary already exists (created by prepare_summary), it is activated instantly. Otherwise, a summary is auto-generated via claude --print. You may also pass a summary parameter to override auto-generation.",
       inputSchema: {
         type: "object",
         properties: {
@@ -862,7 +891,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "prepare_summary",
-      description: "Pre-generate a dormant summary for a topic using claude-opus-4-6 (requires ANTHROPIC_API_KEY). The summary is appended to the file but NOT linked into the active chain. When summarize_topic is later called for this topic, the dormant summary is activated instantly without another LLM call.",
+      description: "Pre-generate a dormant summary for a topic via claude --print. The summary is appended to the file but NOT linked into the active chain. When summarize_topic is later called for this topic, the dormant summary is activated instantly without another LLM call.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1189,7 +1218,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return textResult(
       `Topic "${topic.name}" (${topic.messages.length} messages, ~${topic.estimatedTokens || '?'} tokens):\n\n` +
       contentParts.join('\n\n') +
-      `\n\nYou may now call summarize_topic with this topic_id — it will auto-generate a summary via claude-opus-4-6. Or pass a summary parameter to override.`
+      `\n\nYou may now call summarize_topic with this topic_id — it will auto-generate a summary via claude --print. Or pass a summary parameter to override.`
     );
   }
 
@@ -1206,22 +1235,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     // Use API to generate summary, or fall back to caller-provided text
+    const { v4: uuidv4 } = require('uuid');
+    const agentIdForSummary = uuidv4().replace(/-/g, '').substring(0, 17);
     let summaryText = args.summary;
     if (!summaryText) {
       const content = extractTopicContent(entries, topic);
-      const apiSummary = await generateSummaryWithAPI(content, topic.name, topic.messages.length);
-      if (apiSummary) {
-        summaryText = apiSummary;
-      } else {
-        return textResult(`No ANTHROPIC_API_KEY set and no summary provided. Either set ANTHROPIC_API_KEY or pass a summary parameter.`);
+      try {
+        summaryText = await generateSummaryWithAPI(content, topic.name, topic.messages.length, agentIdForSummary);
+      } catch (apiErr) {
+        return textResult(`API call failed for "${topic.name}": ${apiErr.message}`);
+      }
+      if (!summaryText) {
+        return textResult(`API returned empty response for "${topic.name}". Pass a summary parameter to set manually.`);
       }
     }
 
-    const result = createDormantSummary(entries, topic, summaryText, filePath);
+    const result = createDormantSummary(entries, topic, summaryText, filePath, agentIdForSummary);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(
-      `Prepared dormant summary for "${topic.name}" (${topic.messages.length} msgs) using claude-opus-4-6. ` +
+      `Prepared dormant summary for "${topic.name}" (${topic.messages.length} msgs). ` +
       `Call summarize_topic to activate it.`
     );
   }
@@ -1247,18 +1280,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     // No dormant summary — generate via API or use caller-provided text
+    const { v4: uuidv4 } = require('uuid');
+    const agentIdForSummary = uuidv4().replace(/-/g, '').substring(0, 17);
     let summaryText = args.summary;
     if (!summaryText) {
       const content = extractTopicContent(entries, topic);
-      const apiSummary = await generateSummaryWithAPI(content, topic.name, topic.messages.length);
-      if (apiSummary) {
-        summaryText = apiSummary;
-      } else {
-        return textResult(`No dormant summary exists for "${topic.name}". Set ANTHROPIC_API_KEY for auto-summarization, or provide a summary parameter.`);
+      try {
+        summaryText = await generateSummaryWithAPI(content, topic.name, topic.messages.length, agentIdForSummary);
+      } catch (apiErr) {
+        return textResult(`API call failed for "${topic.name}": ${apiErr.message}`);
+      }
+      if (!summaryText) {
+        return textResult(`No dormant summary exists for "${topic.name}". API returned empty response.`);
       }
     }
 
-    const result = summarizeTopic(entries, topic, summaryText, filePath);
+    const result = summarizeTopic(entries, topic, summaryText, filePath, agentIdForSummary);
     const writeResult = safeWriteHistory(filePath, result);
     if (writeResult.error) return textResult(writeResult.error);
     return textResult(

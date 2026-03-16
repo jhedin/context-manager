@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const { getTokenUsage } = require('./usage.js');
 
 /**
  * Claude Code Stop Hook - Context Monitor + Reparent Cleanup
@@ -13,17 +14,6 @@ const fs = require('fs');
 
 const REPARENT_MARKER = '.claude/pending_reparent.json';
 const AUTO_PRUNE_STATE = '.claude/auto_prune_state.json';
-
-const MODEL_LIMITS = {
-  'claude-opus-4-6':   1000000,
-  'claude-sonnet-4-6': 1000000,
-  'claude-sonnet-4-5': 1000000,
-  'claude-haiku-4-5':   200000,
-  // Legacy model IDs
-  'claude-3-7-sonnet':  200000,
-  'claude-3-5-sonnet':  200000,
-  'claude-3-5-haiku':   200000,
-};
 
 /**
  * Reparent orphaned entries after forget_prune.
@@ -128,31 +118,19 @@ async function main() {
     const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(l => l.trim());
     if (lines.length === 0) return;
 
-    // Find the last message with usage info (walk backwards)
-    let usage = null;
-    let modelId = '';
+    // Extract sessionId (needed for state tracking)
     let sessionId = '';
     for (let i = lines.length - 1; i >= 0; i--) {
-      const entry = JSON.parse(lines[i]);
-      if (!sessionId && entry.sessionId) sessionId = entry.sessionId;
-      if (entry.message?.usage) {
-        usage = entry.message.usage;
-        modelId = entry.message.model || '';
-        break;
-      }
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.sessionId) { sessionId = entry.sessionId; break; }
+      } catch (_) {}
     }
 
-    if (!usage) return;
+    const tokenInfo = getTokenUsage(lines);
+    if (!tokenInfo) return;
 
-    // Determine max tokens: env override > model map > default 1M
-    let maxTokens = parseInt(process.env.CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE) || 0;
-    if (!maxTokens) {
-      const modelMatch = Object.keys(MODEL_LIMITS).find(m => modelId.includes(m));
-      maxTokens = modelMatch ? MODEL_LIMITS[modelMatch] : 1000000;
-    }
-
-    const currentUsage = usage.input_tokens;
-    const usagePercent = (currentUsage / maxTokens) * 100;
+    const { usagePct: usagePercent, currentUsage, maxTokens } = tokenInfo;
 
     // Load auto-prune state to avoid repeating thresholds
     const state = getAutoPruneState(sessionId);

@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:hooks": "node test-hooks.js",
+    "test:e2e": "node test-e2e.js",
+    "test:e2e:integration": "node test-e2e-integration.js"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +16,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "node-pty": "^1.1.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {

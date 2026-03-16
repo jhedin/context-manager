@@ -7,6 +7,9 @@ node_modules/
 .claude/hooks/*.log
 .claude/pending_reparent.json
 .claude/auto_prune_state.json
+.claude/gardener-state.json
+.claude/mcp-startup-env.log
+.claude/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
 
 # Test fixtures
 test_session.jsonl

@@ -3,12 +3,15 @@
 
 const assert = require('assert');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const {
   buildUuidMap, findActiveTail, getActiveChainUuids, getTextContent,
   analyzeEntry, getTopics, scorePruningCandidates, checkForInflightWork,
   bypassTopic, restoreTopic, createDormantSummary, findDormantSummary,
   activateSummary, summarizeTopic, findTopicById, validateSessionPath,
-  guardInflight
+  guardInflight, readHistory, safeWriteHistory, extractTopicContent
 } = require('./context-mcp.js');
 
 let passed = 0;
@@ -551,6 +554,353 @@ test('summarize → restore round-trip', () => {
   assert(!result.error, `restore failed: ${result.error}`);
   assertNoOrphans(result, 'after restore');
   assertChainLength(result, chainBefore, 'summarize→restore round-trip');
+});
+
+// =============================================================================
+console.log('\nextractTopicContent');
+// =============================================================================
+
+test('includes text blocks with role prefix', () => {
+  const entries = makeChain(['start', 'Now topic', 'some work done']);
+  const topics = getTopics(entries);
+  const topic = topics.find(t => t.name.includes('topic'));
+  const content = extractTopicContent(entries, topic);
+  assert(content.includes('[assistant]'), 'should include role prefix');
+  assert(content.includes('some work done'), 'should include text');
+});
+
+test('includes tool_use name', () => {
+  const e1 = makeEntry(uuidv4(), null, '');
+  e1.message.content = [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }];
+  const e2 = { ...makeEntry(uuidv4(), e1.uuid, ''), message: { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'tu1', content: 'file1\nfile2' }
+  ]}};
+  const history = [e1, e2];
+  const topics = getTopics(history);
+  const topic = topics[0];
+  const content = extractTopicContent(history, topic);
+  assert(content.includes('[tool_use: Bash]'), 'should include tool name');
+  assert(content.includes('[tool_result]'), 'should include tool result');
+  assert(content.includes('file1'), 'should include result content');
+});
+
+test('truncates text blocks at 2000 chars', () => {
+  const longText = 'x'.repeat(3000);
+  const entry = makeEntry(uuidv4(), null, longText);
+  const history = [entry];
+  const topics = getTopics(history);
+  const topic = topics[0];
+  const content = extractTopicContent(history, topic);
+  // Should contain truncated text (max 2000 chars of 'x')
+  assert(content.includes('x'.repeat(2000)), 'should have 2000 chars');
+  assert(!content.includes('x'.repeat(2001)), 'should not exceed 2000 chars');
+});
+
+test('truncates tool_result at 500 chars', () => {
+  const e1 = makeEntry(uuidv4(), null, '');
+  e1.message.content = [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }];
+  const bigResult = 'y'.repeat(1000);
+  const e2 = { ...makeEntry(uuidv4(), e1.uuid, ''), message: { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'tu1', content: bigResult }
+  ]}};
+  const history = [e1, e2];
+  const topics = getTopics(history);
+  const topic = topics[0];
+  const content = extractTopicContent(history, topic);
+  assert(content.includes('y'.repeat(500)), 'should include 500 chars of result');
+  assert(!content.includes('y'.repeat(501)), 'should not exceed 500 chars');
+});
+
+// =============================================================================
+console.log('\nanalyzeEntry');
+// =============================================================================
+
+test('counts text chars', () => {
+  const entry = makeEntry(uuidv4(), null, 'hello world');
+  const result = analyzeEntry(entry);
+  assert.strictEqual(result.contentChars, 11);
+  assert.strictEqual(result.toolUseCount, 0);
+  assert.strictEqual(result.toolResultCount, 0);
+});
+
+test('counts tool_use and input', () => {
+  const entry = makeEntry(uuidv4(), null, '');
+  entry.message.content = [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }];
+  const result = analyzeEntry(entry);
+  assert.strictEqual(result.toolUseCount, 1);
+  assert(result.contentChars > 0, 'should count input chars');
+  assert.deepStrictEqual(result.toolNames, ['Bash']);
+});
+
+test('counts tool_result and detects large results', () => {
+  const entry = makeEntry(uuidv4(), null, '');
+  const bigContent = 'z'.repeat(5000);
+  entry.message.role = 'user';
+  entry.message.content = [{ type: 'tool_result', tool_use_id: 'tu1', content: bigContent }];
+  const result = analyzeEntry(entry);
+  assert.strictEqual(result.toolResultCount, 1);
+  assert.strictEqual(result.toolResultChars, 5000);
+  assert(result.hasLargeToolResult, 'should detect large result');
+});
+
+test('small tool_result does not trigger hasLargeToolResult', () => {
+  const entry = makeEntry(uuidv4(), null, '');
+  entry.message.role = 'user';
+  entry.message.content = [{ type: 'tool_result', tool_use_id: 'tu1', content: 'small' }];
+  const result = analyzeEntry(entry);
+  assert(!result.hasLargeToolResult);
+});
+
+// =============================================================================
+console.log('\nscorePruningCandidates detail');
+// =============================================================================
+
+function makeTopicWithChars(chars, toolResultChars = 0, hasLargeTools = false) {
+  return {
+    id: uuidv4(),
+    name: '[Topic] test',
+    messages: [{ uuid: uuidv4(), text: 'x'.repeat(10) }],
+    isOrphan: false,
+    contentChars: chars,
+    toolUses: 0,
+    toolResults: toolResultChars > 0 ? 1 : 0,
+    toolResultChars,
+    hasLargeToolResults: hasLargeTools,
+    toolNames: []
+  };
+}
+
+test('large topic (>10k tool result chars) gets +20 score', () => {
+  // A single topic with large tool results, no recency bias (only 1 active topic < 4)
+  const topic = makeTopicWithChars(100, 15000, false);
+  const scored = scorePruningCandidates([topic]);
+  // Base from chars: Math.round(100/4)/1000 = 0. +20 for toolResultChars>10000
+  assert(scored[0].pruneScore >= 20, `expected >=20, got ${scored[0].pruneScore}`);
+});
+
+test('large tool result (>4000 chars) gets +15 score', () => {
+  const topic = makeTopicWithChars(100, 100, true); // hasLargeToolResults=true
+  const scored = scorePruningCandidates([topic]);
+  assert(scored[0].pruneScore >= 15, `expected >=15, got ${scored[0].pruneScore}`);
+});
+
+test('tool-dense topic (>2 tools per message) gets +10', () => {
+  const topic = {
+    id: uuidv4(), name: '[Topic] dense', isOrphan: false,
+    messages: [{ uuid: uuidv4(), text: 'a' }, { uuid: uuidv4(), text: 'b' }],
+    contentChars: 100, toolUses: 8, toolResults: 0, toolResultChars: 0,
+    hasLargeToolResults: false, toolNames: []
+  };
+  const scored = scorePruningCandidates([topic]);
+  assert(scored[0].pruneScore >= 10, `expected >=10, got ${scored[0].pruneScore}`);
+});
+
+test('first topic gets -20 penalty when activeCount > 4', () => {
+  // 5 active topics — first one should get -20
+  const topics = Array.from({ length: 5 }, (_, i) => ({
+    id: uuidv4(), name: `[Topic] ${i}`, isOrphan: false,
+    messages: [{ uuid: uuidv4(), text: 'a' }],
+    contentChars: 100, toolUses: 0, toolResults: 0, toolResultChars: 0,
+    hasLargeToolResults: false, toolNames: []
+  }));
+  const scored = scorePruningCandidates(topics);
+  assert(scored[0].pruneScore < 0, `first topic should have negative score, got ${scored[0].pruneScore}`);
+});
+
+test('last 25% of topics gets recency penalty', () => {
+  const topics = Array.from({ length: 8 }, (_, i) => ({
+    id: uuidv4(), name: `[Topic] ${i}`, isOrphan: false,
+    messages: [{ uuid: uuidv4(), text: 'a' }],
+    contentChars: 100, toolUses: 0, toolResults: 0, toolResultChars: 0,
+    hasLargeToolResults: false, toolNames: []
+  }));
+  const scored = scorePruningCandidates(topics);
+  // Last topic (index 7 of 8) should have a lower score than middle topic
+  assert(scored[7].pruneScore < scored[3].pruneScore,
+    `newest topic (${scored[7].pruneScore}) should score lower than middle (${scored[3].pruneScore})`);
+});
+
+// =============================================================================
+console.log('\nrestoreTopic summary-pair path');
+// =============================================================================
+
+test('restoreTopic orphans summary pair after summarize', () => {
+  const entries = makeChain(['start', 'Now topic X', 'X1', 'X2', 'Now after X', 'done']);
+  const chainBefore = getActiveChainUuids(entries).size;
+
+  // Summarize topic X
+  let topics = getTopics(entries);
+  const topicX = topics.find(t => t.name.includes('topic X'));
+  let result = summarizeTopic(entries, topicX, 'X summary text');
+
+  // Now restore the orphaned original topic
+  topics = getTopics(result);
+  const orphanedX = topics.find(t => t.name.includes('topic X') && t.isOrphan);
+  assert(orphanedX, 'original topic X should be orphaned');
+  result = restoreTopic(result, orphanedX);
+  assert(!result.error, `restore error: ${result.error}`);
+
+  // Summary assistant entry should have parentUuid: null (orphaned)
+  const summaryAssistant = result.find(e =>
+    e.message?.content?.some(b => b.type === 'tool_use' && b.name === 'Agent') &&
+    e.isSidechain
+  );
+  assert(summaryAssistant, 'summary assistant should exist');
+  assert.strictEqual(summaryAssistant.parentUuid, null, 'summary assistant should be orphaned');
+
+  // Summary result entry should have isSidechain: true
+  const summaryResult = result.find(e =>
+    e.parentUuid === summaryAssistant?.uuid && e.isSidechain
+  );
+  assert(summaryResult, 'summary result should exist');
+  assert(summaryResult.isSidechain, 'summary result should be sidechain');
+
+  // Chain should be restored to original length
+  assertChainLength(result, chainBefore, 'after summarize+restore');
+  assertNoOrphans(result, 'after summarize+restore');
+});
+
+// =============================================================================
+console.log('\nsubagent sidecar files');
+// =============================================================================
+
+test('createDormantSummary writes sidecar files when sessionFilePath provided', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-test-'));
+  const claudeDir = path.join(tmpDir, '.claude');
+  fs.mkdirSync(claudeDir);
+  const sessionPath = path.join(claudeDir, 'test-session.jsonl');
+
+  // Build a simple chain
+  const entries = makeChain(['start', 'Now topic A', 'A work', 'done']);
+  // Set sessionId on all entries so createDormantSummary can use it
+  const sessionId = 'test-session-id';
+  entries.forEach(e => { e.sessionId = sessionId; });
+
+  const topics = getTopics(entries);
+  const topicA = topics.find(t => t.name.includes('topic A'));
+
+  createDormantSummary(entries, topicA, 'Summary of A', sessionPath);
+
+  // Check sidecar files exist
+  const subagentDir = path.join(claudeDir, sessionId, 'subagents');
+  assert(fs.existsSync(subagentDir), 'subagents dir should exist');
+
+  const files = fs.readdirSync(subagentDir);
+  const jsonlFile = files.find(f => f.startsWith('agent-') && f.endsWith('.jsonl'));
+  const metaFile = files.find(f => f.startsWith('agent-') && f.endsWith('.meta.json'));
+  assert(jsonlFile, 'agent .jsonl sidecar should exist');
+  assert(metaFile, 'agent .meta.json should exist');
+
+  // Check meta content
+  const meta = JSON.parse(fs.readFileSync(path.join(subagentDir, metaFile), 'utf8'));
+  assert.strictEqual(meta.agentType, 'summarizer');
+
+  // Check sidecar JSONL content
+  const agentEntries = fs.readFileSync(path.join(subagentDir, jsonlFile), 'utf8')
+    .split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
+
+  // First entry should have parentUuid: null
+  assert.strictEqual(agentEntries[0].parentUuid, null, 'first sidecar entry should have null parentUuid');
+
+  // All non-summary entries should have isSidechain: true
+  assert(agentEntries.slice(0, -1).every(e => e.isSidechain), 'all topic entries should be isSidechain');
+
+  // Last entry should be assistant with summary text
+  const lastEntry = agentEntries[agentEntries.length - 1];
+  assert.strictEqual(lastEntry.type, 'assistant', 'last entry should be assistant');
+  assert(getTextContent(lastEntry).includes('Summary of A'), 'summary text should be in last entry');
+
+  // Cleanup
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('createDormantSummary without sessionFilePath writes no sidecar', () => {
+  const entries = makeChain(['start', 'Now topic B', 'B work']);
+  const topics = getTopics(entries);
+  const topicB = topics.find(t => t.name.includes('topic B'));
+  // Should not throw even with no path
+  const result = createDormantSummary(entries, topicB, 'Summary B');
+  assert.strictEqual(result.length, entries.length + 2);
+});
+
+// =============================================================================
+console.log('\nreadHistory / safeWriteHistory');
+// =============================================================================
+
+test('round-trip: write and read back identical history', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-rw-'));
+  const claudeDir = path.join(tmpDir, '.claude');
+  fs.mkdirSync(claudeDir);
+  const filePath = path.join(claudeDir, 'roundtrip.jsonl');
+
+  const entries = makeChain(['hello', 'Now work', 'done']);
+  entries[0].extra = { nested: true, count: 42 };
+
+  const writeResult = safeWriteHistory(filePath, entries);
+  assert(writeResult.ok, 'safeWriteHistory should return ok: true');
+
+  const readBack = readHistory(filePath);
+  assert.strictEqual(readBack.length, entries.length, 'should read same number of entries');
+  assert.strictEqual(readBack[0].uuid, entries[0].uuid, 'uuid should match');
+  assert.deepStrictEqual(readBack[0].extra, { nested: true, count: 42 }, 'extra fields preserved');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('readHistory returns empty array for nonexistent file', () => {
+  const result = readHistory('/tmp/this-file-definitely-does-not-exist-xyz123.jsonl');
+  assert.deepStrictEqual(result, []);
+});
+
+test('safeWriteHistory returns error on unwritable path', () => {
+  const result = safeWriteHistory('/this/path/cannot/exist/file.jsonl', []);
+  assert(result.error, 'should return error');
+  assert(typeof result.error === 'string');
+});
+
+// =============================================================================
+console.log('\ndormant pair structure validation');
+// =============================================================================
+
+test('dormant assistant entry has stop_reason tool_use', () => {
+  const entries = makeChain(['start', 'Now work', 'done']);
+  const topics = getTopics(entries);
+  const topic = topics.find(t => t.name.includes('work'));
+  const result = createDormantSummary(entries, topic, 'summary text');
+  const assistantEntry = result[result.length - 2];
+  assert.strictEqual(assistantEntry.message.stop_reason, 'tool_use');
+});
+
+test('dormant assistant content[0] is Agent tool_use', () => {
+  const entries = makeChain(['start', 'Now work', 'done']);
+  const topics = getTopics(entries);
+  const topic = topics.find(t => t.name.includes('work'));
+  const result = createDormantSummary(entries, topic, 'summary text');
+  const assistantEntry = result[result.length - 2];
+  const block = assistantEntry.message.content[0];
+  assert.strictEqual(block.type, 'tool_use');
+  assert.strictEqual(block.name, 'Agent');
+});
+
+test('dormant result entry content[0] is tool_result with array content', () => {
+  const entries = makeChain(['start', 'Now work', 'done']);
+  const topics = getTopics(entries);
+  const topic = topics.find(t => t.name.includes('work'));
+  const result = createDormantSummary(entries, topic, 'summary text');
+  const resultEntry = result[result.length - 1];
+  const block = resultEntry.message.content[0];
+  assert.strictEqual(block.type, 'tool_result');
+  assert(Array.isArray(block.content), 'content should be an array');
+  assert(block.content.some(c => c.type === 'text' && c.text.includes('summary text')));
+});
+
+test('dormant result entry has promptId set', () => {
+  const entries = makeChain(['start', 'Now work', 'done']);
+  const topics = getTopics(entries);
+  const topic = topics.find(t => t.name.includes('work'));
+  const result = createDormantSummary(entries, topic, 'summary text');
+  const resultEntry = result[result.length - 1];
+  assert(resultEntry.promptId, 'resultEntry should have promptId');
 });
 
 // =============================================================================
