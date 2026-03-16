@@ -19,7 +19,7 @@
       },
       "homepage": "https://github.com/jhedin/context-manager",
       "tags": ["context", "pruning", "session", "summarization", "branching", "gardener"],
-      "source": "."
+      "source": "./"
     }
   ]
 }
