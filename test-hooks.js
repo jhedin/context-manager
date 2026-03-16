@@ -488,7 +488,7 @@ function testGardenerFewTopics() {
 }
 
 function testGardenerUnsummarizedTopic() {
-  const name = 'gardener.js: exits 2 naming unsummarized topic with tool results';
+  const name = 'gardener.js: exits 0 and queues candidates when unsummarized tool results found';
   try { fs.unlinkSync(GARDENER_STATE); } catch (_) {}
   const { filePath, sessionId } = createGardenerSession([
     { name: 'Initial setup', withToolResult: 'large' },
@@ -497,37 +497,44 @@ function testGardenerUnsummarizedTopic() {
     { name: 'Current work (current)' },
   ]);
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };
-  const { exitCode, stderr } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
+  const { exitCode } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
   try {
-    assert.strictEqual(exitCode, 2, `expected exit 2, got ${exitCode}`);
-    assert.ok(stderr.includes('Initial setup') || stderr.includes('Fix bug'),
-      `expected topic name in output, got: ${stderr.trim()}`);
-    assert.ok(stderr.toLowerCase().includes('prune'), `expected /prune mention, got: ${stderr.trim()}`);
+    assert.strictEqual(exitCode, 0, `expected exit 0, got ${exitCode}`);
+    // State file should record the queued topic IDs
+    assert.ok(fs.existsSync(GARDENER_STATE), 'expected gardener-state.json to be written');
+    const state = JSON.parse(fs.readFileSync(GARDENER_STATE, 'utf8'));
+    assert.ok(state.queuedTopics?.length > 0, `expected queuedTopics to be non-empty, got: ${JSON.stringify(state)}`);
     pass(name);
   } catch (err) { fail(name, err.message); }
-  finally { try { fs.unlinkSync(filePath); } catch (_) {} }
+  finally {
+    try { fs.unlinkSync(filePath); } catch (_) {}
+    try { fs.unlinkSync(GARDENER_STATE); } catch (_) {}
+  }
 }
 
-function testGardenerAlreadySuggested() {
-  const name = 'gardener.js: exits 0 when topic already suggested this session';
+function testGardenerAlreadyQueued() {
+  const name = 'gardener.js: exits 0 and does not re-queue already-queued topics';
   const { filePath, sessionId } = createGardenerSession([
     { name: 'Old work', withToolResult: 'large' },
     { name: 'Middle topic', withToolResult: true },
+    { name: 'Filler step' },
     { name: 'Current (current)' },
   ]);
 
-  // Pre-populate state with the topic IDs
+  // Pre-populate state as if we already queued these topics
   const entries = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
-  // The first boundary entry of 'Old work' is the first entry with that text
   const oldWorkEntry = entries.find(e => e.message?.content?.[0]?.text?.includes('Old work'));
   const middleEntry = entries.find(e => e.message?.content?.[0]?.text?.includes('Middle topic'));
-  const suggestedTopics = [oldWorkEntry?.uuid, middleEntry?.uuid].filter(Boolean);
-  fs.writeFileSync(GARDENER_STATE, JSON.stringify({ sessionId, suggestedTopics }));
+  const queuedTopics = [oldWorkEntry?.uuid, middleEntry?.uuid].filter(Boolean);
+  fs.writeFileSync(GARDENER_STATE, JSON.stringify({ sessionId, queuedTopics }));
 
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };
-  const { exitCode, stderr } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
+  const { exitCode } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
   try {
-    assert.strictEqual(exitCode, 0, `expected exit 0 (already suggested), got ${exitCode}: ${stderr}`);
+    assert.strictEqual(exitCode, 0, `expected exit 0, got ${exitCode}`);
+    // State should be unchanged (no new topics added)
+    const state = JSON.parse(fs.readFileSync(GARDENER_STATE, 'utf8'));
+    assert.deepStrictEqual(state.queuedTopics, queuedTopics, 'queuedTopics should not change');
     pass(name);
   } catch (err) { fail(name, err.message); }
   finally {
@@ -537,7 +544,7 @@ function testGardenerAlreadySuggested() {
 }
 
 function testGardenerAllSummarized() {
-  const name = 'gardener.js: exits 0 when all non-current topics have dormant summaries';
+  const name = 'gardener.js: exits 0 silently when all non-current topics have dormant summaries';
   try { fs.unlinkSync(GARDENER_STATE); } catch (_) {}
   const { filePath, sessionId } = createGardenerSession([
     { name: 'Done topic A', withToolResult: 'large', withDormantSummary: true },
@@ -545,16 +552,22 @@ function testGardenerAllSummarized() {
     { name: 'Current (current)' },
   ]);
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };
-  const { exitCode, stderr } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
+  const { exitCode } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
   try {
-    assert.strictEqual(exitCode, 0, `expected exit 0 (all summarized), got ${exitCode}: ${stderr}`);
+    assert.strictEqual(exitCode, 0, `expected exit 0 (all summarized), got ${exitCode}`);
+    // No state written when nothing to queue
+    const stateExists = fs.existsSync(GARDENER_STATE);
+    if (stateExists) {
+      const state = JSON.parse(fs.readFileSync(GARDENER_STATE, 'utf8'));
+      assert.ok(!state.queuedTopics?.length, 'expected empty queuedTopics');
+    }
     pass(name);
   } catch (err) { fail(name, err.message); }
   finally { try { fs.unlinkSync(filePath); } catch (_) {} }
 }
 
-function testGardenerCriticalUrgency() {
-  const name = 'gardener.js: critical urgency message at >85% context';
+function testGardenerHighUsageQueues() {
+  const name = 'gardener.js: exits 0 and queues at >85% context usage';
   try { fs.unlinkSync(GARDENER_STATE); } catch (_) {}
   // 870000 / 1000000 = 87%
   const { filePath, sessionId } = createGardenerSession([
@@ -564,14 +577,18 @@ function testGardenerCriticalUrgency() {
     { name: 'Current (current)' },
   ], 870000);
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };
-  const { exitCode, stderr } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
+  const { exitCode } = runHook(path.join(CWD, 'hooks/gardener.js'), payload);
   try {
-    assert.strictEqual(exitCode, 2, `expected exit 2, got ${exitCode}`);
-    assert.ok(stderr.includes('CRITICAL') || stderr.includes('URGENT'),
-      `expected urgency prefix, got: ${stderr.trim()}`);
+    assert.strictEqual(exitCode, 0, `expected exit 0, got ${exitCode}`);
+    assert.ok(fs.existsSync(GARDENER_STATE), 'expected gardener-state.json written');
+    const state = JSON.parse(fs.readFileSync(GARDENER_STATE, 'utf8'));
+    assert.ok(state.queuedTopics?.length > 0, 'expected candidates queued');
     pass(name);
   } catch (err) { fail(name, err.message); }
-  finally { try { fs.unlinkSync(filePath); } catch (_) {} }
+  finally {
+    try { fs.unlinkSync(filePath); } catch (_) {}
+    try { fs.unlinkSync(GARDENER_STATE); } catch (_) {}
+  }
 }
 
 
@@ -599,9 +616,9 @@ async function main() {
   console.log('\ngardener.js:');
   testGardenerFewTopics();
   testGardenerUnsummarizedTopic();
-  testGardenerAlreadySuggested();
+  testGardenerAlreadyQueued();
   testGardenerAllSummarized();
-  testGardenerCriticalUrgency();
+  testGardenerHighUsageQueues();
 
   console.log(`\n${passed + failed} hook tests: ${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);

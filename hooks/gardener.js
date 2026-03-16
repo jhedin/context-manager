@@ -2,24 +2,31 @@
 'use strict';
 
 /**
- * Context Gardener — Stop hook that suggests /prune when stale topics are detected.
+ * Context Gardener — Stop hook that pre-generates dormant summaries for stale topics.
  *
  * Two-tier detection:
  * 1. Structural: topics with tool_result content but no dormant summary (fast, no LLM)
- * 2. Semantic: LLM reasoning via claude --print --model claude-haiku-4-5 (only when needed)
+ * 2. Semantic: LLM reasoning via claude --print (only when tier 1 finds nothing and usage >40%)
  *
- * Exits 2 with a specific suggestion if candidates found. Silent (exit 0) otherwise.
- * Never modifies the session file.
+ * When candidates are found, spawns gardener-worker.js as a detached background
+ * process to generate dormant summaries. The hook exits 0 immediately — it does
+ * not block the next turn.
+ *
+ * The worker writes summaries to the JSONL directly. Next time /prune runs,
+ * those topics show [READY] and activate instantly with no LLM call.
+ *
+ * Silent (exit 0) always. Never exits 2.
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const { getTokenUsage } = require('./usage.js');
 const { getTopics, findDormantSummary, extractTopicContent } = require('../context-mcp.js');
 
 const GARDENER_STATE = '.claude/gardener-state.json';
+const WORKER_PATH = path.join(__dirname, 'gardener-worker.js');
 
 // --- State management ---
 
@@ -30,7 +37,7 @@ function loadState(sessionId) {
       if (state.sessionId === sessionId) return state;
     }
   } catch (_) {}
-  return { sessionId, suggestedTopics: [] };
+  return { sessionId, queuedTopics: [] };
 }
 
 function saveState(state) {
@@ -68,27 +75,19 @@ function hasToolResults(messages, entries) {
   return false;
 }
 
-// Minimum combined tool_result bytes before tier 1 fires a suggestion.
+// Minimum combined tool_result bytes before tier 1 fires.
 const TIER1_MIN_TOTAL_BYTES = 10 * 1024; // 10KB
 
-function tier1Scan(topics, entries, suggestedTopics) {
+function tier1Scan(topics, entries, queuedTopics) {
   // Exclude the last 2 topics — recent work isn't stale yet
   const candidates = [];
   const scannable = topics.slice(0, -2);
   for (const topic of scannable) {
-    if (suggestedTopics.includes(topic.id)) continue;
+    if (queuedTopics.includes(topic.id)) continue;
     if (!hasToolResults(topic.messages, entries)) continue;
     if (findDormantSummary(entries, topic.id)) continue; // already summarized
     const size = toolResultSize(topic.messages, entries);
-    candidates.push({
-      id: topic.id,
-      name: topic.name,
-      reason: size > 2048
-        ? `unsummarized tool results (~${Math.round(size / 1024)}KB)`
-        : 'unsummarized tool results',
-      op: 'summarize',
-      size,
-    });
+    candidates.push({ id: topic.id, name: topic.name, size });
   }
 
   // Only fire if total unsummarized content is substantial
@@ -123,22 +122,21 @@ function tier2Reason(topics, entries, usagePct) {
     `Current work: "${current.name}" — ${currentPreview}\n` +
     `Context usage: ${Math.round(usagePct)}%\n\n` +
     `Topics (excluding current):\n${topicList}\n\n` +
-    `Which topics (if any) are no longer relevant to the current work and are safe to summarize or forget?\n\n` +
+    `Which topics (if any) are no longer relevant to the current work and are safe to summarize?\n\n` +
     `Respond with JSON only — no markdown, no explanation:\n` +
     `{ "action": "NO_ACTION" }\n` +
     `OR\n` +
-    `{ "action": "SUGGEST", "candidates": [{ "id": "...", "name": "...", "reason": "one line", "op": "summarize" }] }\n\n` +
+    `{ "action": "SUGGEST", "candidates": [{ "id": "...", "name": "..." }] }\n\n` +
     `Rules:\n` +
     `- Only flag topics that are clearly done or unrelated to current work\n` +
     `- If uncertain, respond NO_ACTION\n` +
-    `- Never flag the most recent topic\n` +
-    `- Prefer "summarize" over "forget"`;
+    `- Never flag the most recent topic`;
 
   try {
     const result = spawnSync('claude', [
       '--print', prompt,
       '--output-format', 'text',
-      '--model', 'claude-haiku-4-5',
+      '--model', 'claude-haiku-4-5-20251001',
     ], {
       cwd: os.tmpdir(),
       env: { ...process.env },
@@ -149,7 +147,6 @@ function tier2Reason(topics, entries, usagePct) {
 
     if (result.status !== 0 || !result.stdout?.trim()) return [];
 
-    // Extract JSON from response (strip any accidental markdown)
     const raw = result.stdout.trim();
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return [];
@@ -162,29 +159,19 @@ function tier2Reason(topics, entries, usagePct) {
   }
 }
 
-// --- Output message ---
+// --- Spawn background worker ---
 
-function buildMessage(candidates, usagePct) {
-  const usageNote = usagePct > 0 ? ` (context: ${Math.round(usagePct)}%)` : '';
-  const totalKB = Math.round(candidates.reduce((sum, c) => sum + (c.size || 0), 0) / 1024);
-
-  let reasons;
-  if (candidates.length > 5) {
-    // Many micro-topics — summarize rather than enumerate
-    reasons = `  • ${candidates.length} topics with unsummarized tool results (~${totalKB}KB total)`;
-  } else {
-    // Few candidates — name them specifically
-    const sorted = [...candidates].sort((a, b) => (b.size || 0) - (a.size || 0));
-    reasons = sorted.map(c => `  • ${c.name}: ${c.reason}`).join('\n');
-  }
-
-  if (usagePct >= 85) {
-    return `[CRITICAL] Context at ${Math.round(usagePct)}% — please tell the user to run /prune:\n${reasons}`;
-  }
-  if (usagePct >= 60) {
-    return `[Context gardener] Older topics have unsummarized tool results${usageNote}. Let the user know they can run /prune:\n${reasons}`;
-  }
-  return `[Context gardener] Some older topics could be pruned${usageNote}. You may let the user know /prune is available:\n${reasons}`;
+function spawnWorker(transcriptPath, candidates) {
+  const spec = JSON.stringify({ transcriptPath, candidates });
+  try {
+    const child = spawn(process.execPath, [WORKER_PATH], {
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
+    child.stdin.write(spec);
+    child.stdin.end();
+    child.unref();
+  } catch (_) {}
 }
 
 // --- Main ---
@@ -222,7 +209,7 @@ async function main() {
     const state = loadState(sessionId);
 
     // Tier 1: structural
-    const candidates1 = tier1Scan(topics, entries, state.suggestedTopics);
+    const candidates1 = tier1Scan(topics, entries, state.queuedTopics);
 
     // Tier 2: LLM — run only when tier 1 found nothing and usage is elevated
     let candidates2 = [];
@@ -230,10 +217,10 @@ async function main() {
       candidates2 = tier2Reason(topics, entries, usagePct);
     }
 
-    // Merge, deduplicate, filter already-suggested
+    // Merge, deduplicate, filter already-queued
     const seen = new Set();
     const all = [...candidates1, ...candidates2].filter(c => {
-      if (state.suggestedTopics.includes(c.id)) return false;
+      if (state.queuedTopics.includes(c.id)) return false;
       if (seen.has(c.id)) return false;
       seen.add(c.id);
       return true;
@@ -241,15 +228,17 @@ async function main() {
 
     if (all.length === 0) return;
 
-    // Persist suggestions so we don't nag again this session
-    state.suggestedTopics.push(...all.map(c => c.id));
+    // Record queued topics so we don't re-queue next turn
+    state.queuedTopics.push(...all.map(c => c.id));
     saveState(state);
 
-    process.stderr.write(buildMessage(all, usagePct) + '\n');
-    process.exit(2);
+    // Sort by size descending, hand top candidates to worker
+    const sorted = [...all].sort((a, b) => (b.size || 0) - (a.size || 0));
+    spawnWorker(transcriptPath, sorted);
   } catch (_) {
-    process.exit(0);
+    // Never crash — silently exit 0
   }
+  process.exit(0);
 }
 
 main();
