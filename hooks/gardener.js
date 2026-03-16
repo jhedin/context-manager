@@ -165,15 +165,18 @@ function tier2Reason(topics, entries, usagePct) {
 // --- Output message ---
 
 function buildMessage(candidates, usagePct) {
-  // Sort by size descending, cap display at top 3
-  const sorted = [...candidates].sort((a, b) => (b.size || 0) - (a.size || 0));
-  const top = sorted.slice(0, 3);
-  const rest = sorted.length - top.length;
-
-  const reasons = top.map(c => `  • ${c.name}: ${c.reason}`).join('\n')
-    + (rest > 0 ? `\n  • …and ${rest} more` : '');
-
   const usageNote = usagePct > 0 ? ` (context: ${Math.round(usagePct)}%)` : '';
+  const totalKB = Math.round(candidates.reduce((sum, c) => sum + (c.size || 0), 0) / 1024);
+
+  let reasons;
+  if (candidates.length > 5) {
+    // Many micro-topics — summarize rather than enumerate
+    reasons = `  • ${candidates.length} topics with unsummarized tool results (~${totalKB}KB total)`;
+  } else {
+    // Few candidates — name them specifically
+    const sorted = [...candidates].sort((a, b) => (b.size || 0) - (a.size || 0));
+    reasons = sorted.map(c => `  • ${c.name}: ${c.reason}`).join('\n');
+  }
 
   if (usagePct >= 85) {
     return `[CRITICAL] Context at ${Math.round(usagePct)}% — please tell the user to run /prune:\n${reasons}`;
