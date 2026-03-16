@@ -7,7 +7,6 @@
   },
   "license": "MIT",
   "keywords": ["context", "pruning", "session", "summarization", "branching"],
-  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json",
   "skills": "./skills/"
 }
