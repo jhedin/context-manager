@@ -5,14 +5,17 @@ A Claude Code plugin that gives you control over your session's context window. 
 ## Install
 
 ```bash
-# From GitHub (once published)
-claude plugin add https://github.com/YOUR_USERNAME/context-manager
-
-# Or test locally
-claude --plugin-dir /path/to/context-manager
+# Add this repo as a marketplace, then install
+claude plugins marketplace add https://github.com/jhedin/context-manager
+claude plugins install context-manager
 ```
 
-After installing, restart Claude Code or run `/reload-plugins`.
+Restart Claude Code after installing to activate the hooks and MCP server.
+
+To test locally without installing:
+```bash
+claude --plugin-dir /path/to/context-manager
+```
 
 ## What it does
 
@@ -20,15 +23,22 @@ Claude Code sessions grow as you work. Tool outputs, debugging loops, and explor
 
 ### Auto-prune (hands-free)
 
-The Stop hook monitors your context usage and triggers automatic pruning:
+Two hooks work together to manage context automatically:
+
+**Context Gardener** — fires after every turn, suggests `/prune` when it finds stale content:
+- Tier 1 (structural): detects topics with unsummarized tool_result content — no LLM, instant
+- Tier 2 (semantic): uses Haiku to reason about topic relevance when tier 1 finds nothing and usage is >40%
+- Names specific topics in its suggestion; silent when nothing needs pruning
+
+**Token threshold monitor** — fires at fixed usage levels:
 
 | Threshold | Action |
 |-----------|--------|
-| **40%** | Tells the agent to `/prune` — summarize top 3-4 candidates |
-| **60%** | Tells the agent to `/prune` — summarize all high-scoring topics |
+| **40%** | Suggests `/prune` — summarize top 3-4 candidates |
+| **60%** | Suggests `/prune` — summarize all high-scoring topics |
 | **85%** | Emergency — bypass all tool-heavy topics immediately |
 
-Each threshold fires once per session. The agent runs `/prune`, picks the best candidates, summarizes them, and erases the prune interaction from history so you never see it.
+Each threshold fires once per session.
 
 ### Manual commands
 
@@ -56,14 +66,16 @@ Session files are JSONL with a `parentUuid`-linked DAG. The plugin:
 ### Architecture
 
 ```
-context-mcp.js          MCP server — 11 tools for DAG manipulation
-hooks/stop.js           Stop hook — reparent cleanup + auto-prune monitor
-hooks/pre-backup.js     PreToolUse — backup before every write
+context-mcp.js              MCP server — 12 tools for DAG manipulation
+hooks/stop.js               Stop hook — reparent cleanup + token threshold monitor
+hooks/gardener.js           Stop hook — relevance-based /prune suggestions
+hooks/usage.js              Shared token usage utility
+hooks/pre-backup.js         PreToolUse — backup before every write
 hooks/post-forget-prune.js  PostToolUse — early reparent pass
-skills/prune/           /prune skill orchestration
-skills/branch/          /branch skill
-skills/merge/           /merge skill
-skills/restore/         /restore skill
+skills/prune/               /prune skill orchestration
+skills/branch/              /branch skill
+skills/merge/               /merge skill
+skills/restore/             /restore skill
 ```
 
 ## Requirements
