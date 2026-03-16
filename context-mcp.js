@@ -244,15 +244,20 @@ function analyzeEntry(entry) {
   return { contentChars, toolUseCount, toolResultCount, toolResultChars, hasLargeToolResult, toolNames };
 }
 
-function getTopics(history) {
+// Minimum messages a topic must have to stand alone. Shorter topics are
+// merged into the previous one. parentUuid=null boundaries are always kept.
+const TOPIC_MIN_MESSAGES = 4;
+
+function getTopics(history, { minMessages = TOPIC_MIN_MESSAGES } = {}) {
   const activeUuids = getActiveChainUuids(history);
 
-  const topics = [];
+  const raw = [];
   // Use first message UUID as stable topic ID (survives re-scans)
   let currentTopic = {
     id: history[0]?.uuid || '0', name: "[Start] Initial Context", messages: [], isOrphan: false,
     contentChars: 0, toolUses: 0, toolResults: 0, toolResultChars: 0,
-    hasLargeToolResults: false, toolNames: new Set()
+    hasLargeToolResults: false, toolNames: new Set(),
+    hardBoundary: true,  // parentUuid=null — never merge across this
   };
 
   history.forEach((entry, idx) => {
@@ -261,21 +266,22 @@ function getTopics(history) {
     if (entry.dormantSummaryFor) return;
 
     const text = getTextContent(entry);
-    const isTopicShift = text.toLowerCase().startsWith('now ') ||
-                         text.toLowerCase().startsWith('next ') ||
-                         !entry.parentUuid;
+    const hardBoundary = !entry.parentUuid;
+    const softBoundary = text.toLowerCase().startsWith('now ') ||
+                         text.toLowerCase().startsWith('next ');
+    const isTopicShift = (hardBoundary || softBoundary) && idx > 0;
 
-    if (isTopicShift && idx > 0) {
-      currentTopic.toolNames = [...currentTopic.toolNames];
-      topics.push(currentTopic);
+    if (isTopicShift) {
+      raw.push(currentTopic);
       const shortName = text.split(/[.!?]/)[0].substring(0, 40) || "Phase Start";
       currentTopic = {
-        id: entry.uuid,  // Stable: UUID of first message in topic
+        id: entry.uuid,
         name: `[Topic] ${shortName}`,
         messages: [],
         isOrphan: !activeUuids.has(entry.uuid),
         contentChars: 0, toolUses: 0, toolResults: 0, toolResultChars: 0,
-        hasLargeToolResults: false, toolNames: new Set()
+        hasLargeToolResults: false, toolNames: new Set(),
+        hardBoundary,
       };
     }
 
@@ -290,8 +296,31 @@ function getTopics(history) {
     currentTopic.messages.push({ uuid: entry.uuid, parentUuid: entry.parentUuid, text });
   });
 
-  currentTopic.toolNames = [...currentTopic.toolNames];
-  topics.push(currentTopic);
+  raw.push(currentTopic);
+
+  // Merge short soft-boundary topics into their predecessor.
+  // Hard boundaries (parentUuid=null) are never merged.
+  const topics = [];
+  for (const topic of raw) {
+    const prev = topics[topics.length - 1];
+    if (prev && !topic.hardBoundary && minMessages > 0 && topic.messages.length < minMessages) {
+      // Absorb into previous topic
+      prev.messages.push(...topic.messages);
+      prev.contentChars += topic.contentChars;
+      prev.toolUses += topic.toolUses;
+      prev.toolResults += topic.toolResults;
+      prev.toolResultChars += topic.toolResultChars;
+      if (topic.hasLargeToolResults) prev.hasLargeToolResults = true;
+      for (const name of topic.toolNames) prev.toolNames.add(name);
+      // Keep prev's name and id (the absorbed topic was a fragment)
+    } else {
+      topics.push(topic);
+    }
+  }
+
+  // Convert toolNames Sets to arrays now that merging is done
+  for (const t of topics) t.toolNames = [...t.toolNames];
+
   return topics;
 }
 

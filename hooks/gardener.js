@@ -68,11 +68,14 @@ function hasToolResults(messages, entries) {
   return false;
 }
 
+// Minimum combined tool_result bytes before tier 1 fires a suggestion.
+const TIER1_MIN_TOTAL_BYTES = 10 * 1024; // 10KB
+
 function tier1Scan(topics, entries, suggestedTopics) {
-  // All topics except the last (current)
+  // Exclude the last 2 topics — recent work isn't stale yet
   const candidates = [];
-  const nonCurrent = topics.slice(0, -1);
-  for (const topic of nonCurrent) {
+  const scannable = topics.slice(0, -2);
+  for (const topic of scannable) {
     if (suggestedTopics.includes(topic.id)) continue;
     if (!hasToolResults(topic.messages, entries)) continue;
     if (findDormantSummary(entries, topic.id)) continue; // already summarized
@@ -87,6 +90,10 @@ function tier1Scan(topics, entries, suggestedTopics) {
       size,
     });
   }
+
+  // Only fire if total unsummarized content is substantial
+  const totalBytes = candidates.reduce((sum, c) => sum + c.size, 0);
+  if (totalBytes < TIER1_MIN_TOTAL_BYTES) return [];
   return candidates;
 }
 
@@ -158,16 +165,23 @@ function tier2Reason(topics, entries, usagePct) {
 // --- Output message ---
 
 function buildMessage(candidates, usagePct) {
-  const names = candidates.map(c => `"${c.name}"`).join(' and ');
-  const reasons = candidates.map(c => `  • ${c.name}: ${c.reason}`).join('\n');
+  // Sort by size descending, cap display at top 3
+  const sorted = [...candidates].sort((a, b) => (b.size || 0) - (a.size || 0));
+  const top = sorted.slice(0, 3);
+  const rest = sorted.length - top.length;
+
+  const reasons = top.map(c => `  • ${c.name}: ${c.reason}`).join('\n')
+    + (rest > 0 ? `\n  • …and ${rest} more` : '');
+
+  const usageNote = usagePct > 0 ? ` (context: ${Math.round(usagePct)}%)` : '';
 
   if (usagePct >= 85) {
-    return `[CRITICAL] Context at ${Math.round(usagePct)}%. Stale topics detected:\n${reasons}\nRun /prune immediately.`;
+    return `[CRITICAL] Context at ${Math.round(usagePct)}% — please tell the user to run /prune:\n${reasons}`;
   }
   if (usagePct >= 60) {
-    return `[URGENT] Context at ${Math.round(usagePct)}%. ${names} look stale:\n${reasons}\nRun /prune now.`;
+    return `[Context gardener] Older topics have unsummarized tool results${usageNote}. Let the user know they can run /prune:\n${reasons}`;
   }
-  return `Context gardener: ${names} look done.\n${reasons}\nRun /prune to compress them.`;
+  return `[Context gardener] Some older topics could be pruned${usageNote}. You may let the user know /prune is available:\n${reasons}`;
 }
 
 // --- Main ---
@@ -207,9 +221,9 @@ async function main() {
     // Tier 1: structural
     const candidates1 = tier1Scan(topics, entries, state.suggestedTopics);
 
-    // Tier 2: LLM — run if tier 1 found nothing and usage > 40%, or usage > 85%
+    // Tier 2: LLM — run only when tier 1 found nothing and usage is elevated
     let candidates2 = [];
-    if ((candidates1.length === 0 && usagePct > 40) || usagePct > 85) {
+    if (candidates1.length === 0 && usagePct > 40) {
       candidates2 = tier2Reason(topics, entries, usagePct);
     }
 

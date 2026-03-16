@@ -382,6 +382,21 @@ function createGardenerSession(topics, usageTokens = 1000) {
     });
     prevUuid = boundaryUuid;
 
+    // Add filler messages so every topic has >= TOPIC_MIN_MESSAGES (4) messages
+    // and survives the merge heuristic in getTopics().
+    for (let f = 0; f < 3; f++) {
+      const fillerUuid = uuidv4();
+      entries.push({
+        uuid: fillerUuid,
+        parentUuid: prevUuid,
+        type: 'assistant',
+        sessionId,
+        timestamp: new Date().toISOString(),
+        message: { role: 'assistant', model: 'claude-sonnet-4-6', content: [{ type: 'text', text: `Step ${f + 1}.` }] },
+      });
+      prevUuid = fillerUuid;
+    }
+
     // Optional tool_result entry
     if (topic.withToolResult) {
       const toolUseUuid = uuidv4();
@@ -401,7 +416,7 @@ function createGardenerSession(topics, usageTokens = 1000) {
 
       const resultUuid = uuidv4();
       const blob = topic.withToolResult === 'large'
-        ? 'x'.repeat(3000) // >2KB
+        ? 'x'.repeat(12000) // ~12KB — exceeds TIER1_MIN_TOTAL_BYTES (10KB) on its own
         : 'small result';
       entries.push({
         uuid: resultUuid,
@@ -478,6 +493,7 @@ function testGardenerUnsummarizedTopic() {
   const { filePath, sessionId } = createGardenerSession([
     { name: 'Initial setup', withToolResult: 'large' },
     { name: 'Fix bug', withToolResult: true },
+    { name: 'Refactor step' },
     { name: 'Current work (current)' },
   ]);
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };
@@ -544,6 +560,7 @@ function testGardenerCriticalUrgency() {
   const { filePath, sessionId } = createGardenerSession([
     { name: 'Big file read', withToolResult: 'large' },
     { name: 'Another topic', withToolResult: true },
+    { name: 'Middle step' },
     { name: 'Current (current)' },
   ], 870000);
   const payload = { session_id: sessionId, transcript_path: filePath, stop_hook_active: false };

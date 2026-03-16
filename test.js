@@ -153,14 +153,14 @@ console.log('\ngetTopics');
 
 test('splits on "Now " prefix', () => {
   const entries = makeChain(['Initial setup', 'doing stuff', 'Now fix the bug', 'fixed it']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   assert.strictEqual(topics.length, 2);
   assert.strictEqual(topics[1].messages.length, 2);
 });
 
 test('splits on "Next " prefix', () => {
   const entries = makeChain(['start', 'Next add tests', 'test code']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   assert.strictEqual(topics.length, 2);
 });
 
@@ -168,7 +168,7 @@ test('skips dormant summary entries', () => {
   const entries = makeChain(['start', 'Now do work', 'done']);
   entries.push({ uuid: uuidv4(), parentUuid: null, dormantSummaryFor: entries[1].uuid,
     message: { role: 'assistant', content: [{ type: 'text', text: 'dormant' }] } });
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   // Dormant should not create its own topic
   const allMsgs = topics.flatMap(t => t.messages);
   assert(!allMsgs.some(m => m.text === 'dormant'));
@@ -177,10 +177,10 @@ test('skips dormant summary entries', () => {
 test('marks orphaned topics after bypass', () => {
   // Need a topic in the middle (not the last) so bypass has something to reparent
   const entries = makeChain(['start', 'Now do work', 'work done', 'Now finish up', 'finished']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('do work'));
   const bypassed = bypassTopic(entries, topic);
-  const topics2 = getTopics(bypassed);
+  const topics2 = getTopics(bypassed, { minMessages: 0 });
   const orphanTopic = topics2.find(t => t.name.includes('do work'));
   assert(orphanTopic, 'orphaned topic should exist');
   assert(orphanTopic.isOrphan, 'topic should be marked as orphan');
@@ -194,7 +194,7 @@ test('orphans score 0', () => {
   const entries = makeChain(['start', 'Now work']);
   const orphan = makeEntry(uuidv4(), 'gone', 'Now orphan');
   entries.push(orphan);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const scored = scorePruningCandidates(topics);
   const orphanScored = scored.find(t => t.messages.some(m => m.text === 'Now orphan'));
   assert.strictEqual(orphanScored.pruneScore, 0);
@@ -202,7 +202,7 @@ test('orphans score 0', () => {
 
 test('summaries score 0', () => {
   const entries = makeChain(['start', '[SUMMARY of "test" — 5 messages condensed]\n\nSummary text']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const scored = scorePruningCandidates(topics);
   const summaryTopic = scored.find(t => t.messages.some(m => m.text?.startsWith('[SUMMARY of')));
   if (summaryTopic) assert.strictEqual(summaryTopic.pruneScore, 0);
@@ -214,7 +214,7 @@ console.log('\nbypassTopic');
 
 test('removes topic from active chain', () => {
   const entries = makeChain(['start', 'Now topic A', 'A work', 'Now topic B', 'B work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topicA = topics.find(t => t.name.includes('topic A'));
   const result = bypassTopic(entries, topicA);
   assertChainLength(result, 3, 'after bypass'); // start + topicB + B work
@@ -225,11 +225,11 @@ test('bypass is reversible via restore', () => {
   const entries = makeChain(['start', 'Now topic A', 'A work', 'Now topic B', 'B work']);
   const chainBefore = getActiveChainUuids(entries).size;
 
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topicA = topics.find(t => t.name.includes('topic A'));
   const bypassed = bypassTopic(entries, topicA);
 
-  const topics2 = getTopics(bypassed);
+  const topics2 = getTopics(bypassed, { minMessages: 0 });
   const topicA2 = topics2.find(t => t.name.includes('topic A'));
   assert(topicA2.isOrphan, 'topic should be orphaned after bypass');
 
@@ -243,7 +243,7 @@ test('bypass middle topic preserves chain integrity', () => {
   const entries = makeChain([
     'start', 'Now A', 'A1', 'A2', 'Now B', 'B1', 'Now C', 'C1'
   ]);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topicB = topics.find(t => t.name.includes(' B'));
   const result = bypassTopic(entries, topicB);
   assertNoOrphans(result, 'bypass middle');
@@ -259,7 +259,7 @@ console.log('\nrestoreTopic');
 
 test('errors on non-orphaned topic', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => !t.isOrphan && t.name.includes('work'));
   if (topic) {
     const result = restoreTopic(entries, topic);
@@ -274,7 +274,7 @@ console.log('\ndormant summaries');
 test('createDormantSummary appends without affecting chain', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
   const chainBefore = getActiveChainUuids(entries).size;
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
 
   const result = createDormantSummary(entries, topic, 'Summary text');
@@ -292,7 +292,7 @@ test('createDormantSummary appends without affecting chain', () => {
 
 test('findDormantSummary finds by exact ID', () => {
   const entries = makeChain(['start', 'Now work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
 
   const withDormant = createDormantSummary(entries, topic, 'test');
@@ -311,7 +311,7 @@ test('findDormantSummary returns null when none exists', () => {
 
 test('activateSummary links dormant pair into chain', () => {
   const entries = makeChain(['start', 'Now work', 'w1', 'Now after', 'a1']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
 
   const withDormant = createDormantSummary(entries, topic, 'Summary');
@@ -332,7 +332,7 @@ test('activateSummary links dormant pair into chain', () => {
 
 test('summarizeTopic uses dormant if available', () => {
   const entries = makeChain(['start', 'Now work', 'w1', 'Now after', 'a1']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
 
   // Pre-create dormant
@@ -341,7 +341,7 @@ test('summarizeTopic uses dormant if available', () => {
   const assistantEntryUuid = withDormant[withDormant.length - 2].uuid;
 
   // summarizeTopic should activate the dormant, not create a new one
-  const topics2 = getTopics(withDormant);
+  const topics2 = getTopics(withDormant, { minMessages: 0 });
   const topic2 = topics2.find(t => t.name.includes('work'));
   const result = summarizeTopic(withDormant, topic2, 'This text should be ignored');
 
@@ -353,7 +353,7 @@ test('summarizeTopic uses dormant if available', () => {
 
 test('summarizeTopic creates inline when no dormant', () => {
   const entries = makeChain(['start', 'Now work', 'w1', 'Now after', 'a1']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
 
   const result = summarizeTopic(entries, topic, 'Inline summary');
@@ -378,14 +378,14 @@ console.log('\nfindTopicById');
 
 test('finds by exact ID', () => {
   const entries = makeChain(['start', 'Now work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const { topic } = findTopicById(topics, topics[1].id);
   assert.strictEqual(topic.id, topics[1].id);
 });
 
 test('finds by 8+ char prefix', () => {
   const entries = makeChain(['start', 'Now work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const prefix = topics[1].id.substring(0, 10);
   const { topic } = findTopicById(topics, prefix);
   assert.strictEqual(topic.id, topics[1].id);
@@ -393,7 +393,7 @@ test('finds by 8+ char prefix', () => {
 
 test('rejects prefix shorter than 8 chars', () => {
   const entries = makeChain(['start', 'Now work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const { error } = findTopicById(topics, 'abc');
   assert(error, 'should error on short prefix');
   assert(error.includes('too short'));
@@ -401,7 +401,7 @@ test('rejects prefix shorter than 8 chars', () => {
 
 test('errors on not found', () => {
   const entries = makeChain(['start']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const { error } = findTopicById(topics, 'aaaaaaaa-bbbb');
   assert(error, 'should error');
   assert(error.includes('not found'));
@@ -500,7 +500,7 @@ test('multiple bypasses and restores maintain chain', () => {
   const chainBefore = getActiveChainUuids(entries).size;
 
   // Save topic IDs before any mutations
-  let topics = getTopics(entries);
+  let topics = getTopics(entries, { minMessages: 0 });
   const topicBId = topics.find(t => t.name.includes('do B')).id;
   const topicCId = topics.find(t => t.name.includes('do C')).id;
 
@@ -510,13 +510,13 @@ test('multiple bypasses and restores maintain chain', () => {
   assertNoOrphans(result, 'after bypass B');
 
   // Bypass C
-  topics = getTopics(result);
+  topics = getTopics(result, { minMessages: 0 });
   let topicC = topics.find(t => t.id === topicCId);
   result = bypassTopic(result, topicC);
   assertNoOrphans(result, 'after bypass C');
 
   // Restore B
-  topics = getTopics(result);
+  topics = getTopics(result, { minMessages: 0 });
   topicB = topics.find(t => t.id === topicBId && t.isOrphan);
   assert(topicB, 'B should be orphaned');
   result = restoreTopic(result, topicB);
@@ -524,7 +524,7 @@ test('multiple bypasses and restores maintain chain', () => {
   assertNoOrphans(result, 'after restore B');
 
   // Restore C
-  topics = getTopics(result);
+  topics = getTopics(result, { minMessages: 0 });
   topicC = topics.find(t => t.id === topicCId && t.isOrphan);
   assert(topicC, 'C should be orphaned');
   result = restoreTopic(result, topicC);
@@ -541,13 +541,13 @@ test('summarize → restore round-trip', () => {
   const chainBefore = getActiveChainUuids(entries).size;
 
   // Summarize
-  let topics = getTopics(entries);
+  let topics = getTopics(entries, { minMessages: 0 });
   let topicX = topics.find(t => t.name.includes('topic X'));
   let result = summarizeTopic(entries, topicX, 'X was summarized');
   assertNoOrphans(result, 'after summarize');
 
   // Restore
-  topics = getTopics(result);
+  topics = getTopics(result, { minMessages: 0 });
   topicX = topics.find(t => t.name.includes('topic X') && t.isOrphan);
   assert(topicX, 'original topic should be orphaned');
   result = restoreTopic(result, topicX);
@@ -562,7 +562,7 @@ console.log('\nextractTopicContent');
 
 test('includes text blocks with role prefix', () => {
   const entries = makeChain(['start', 'Now topic', 'some work done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('topic'));
   const content = extractTopicContent(entries, topic);
   assert(content.includes('[assistant]'), 'should include role prefix');
@@ -576,7 +576,7 @@ test('includes tool_use name', () => {
     { type: 'tool_result', tool_use_id: 'tu1', content: 'file1\nfile2' }
   ]}};
   const history = [e1, e2];
-  const topics = getTopics(history);
+  const topics = getTopics(history, { minMessages: 0 });
   const topic = topics[0];
   const content = extractTopicContent(history, topic);
   assert(content.includes('[tool_use: Bash]'), 'should include tool name');
@@ -588,7 +588,7 @@ test('truncates text blocks at 2000 chars', () => {
   const longText = 'x'.repeat(3000);
   const entry = makeEntry(uuidv4(), null, longText);
   const history = [entry];
-  const topics = getTopics(history);
+  const topics = getTopics(history, { minMessages: 0 });
   const topic = topics[0];
   const content = extractTopicContent(history, topic);
   // Should contain truncated text (max 2000 chars of 'x')
@@ -604,7 +604,7 @@ test('truncates tool_result at 500 chars', () => {
     { type: 'tool_result', tool_use_id: 'tu1', content: bigResult }
   ]}};
   const history = [e1, e2];
-  const topics = getTopics(history);
+  const topics = getTopics(history, { minMessages: 0 });
   const topic = topics[0];
   const content = extractTopicContent(history, topic);
   assert(content.includes('y'.repeat(500)), 'should include 500 chars of result');
@@ -729,12 +729,12 @@ test('restoreTopic orphans summary pair after summarize', () => {
   const chainBefore = getActiveChainUuids(entries).size;
 
   // Summarize topic X
-  let topics = getTopics(entries);
+  let topics = getTopics(entries, { minMessages: 0 });
   const topicX = topics.find(t => t.name.includes('topic X'));
   let result = summarizeTopic(entries, topicX, 'X summary text');
 
   // Now restore the orphaned original topic
-  topics = getTopics(result);
+  topics = getTopics(result, { minMessages: 0 });
   const orphanedX = topics.find(t => t.name.includes('topic X') && t.isOrphan);
   assert(orphanedX, 'original topic X should be orphaned');
   result = restoreTopic(result, orphanedX);
@@ -776,7 +776,7 @@ test('createDormantSummary writes sidecar files when sessionFilePath provided', 
   const sessionId = 'test-session-id';
   entries.forEach(e => { e.sessionId = sessionId; });
 
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topicA = topics.find(t => t.name.includes('topic A'));
 
   createDormantSummary(entries, topicA, 'Summary of A', sessionPath);
@@ -816,7 +816,7 @@ test('createDormantSummary writes sidecar files when sessionFilePath provided', 
 
 test('createDormantSummary without sessionFilePath writes no sidecar', () => {
   const entries = makeChain(['start', 'Now topic B', 'B work']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topicB = topics.find(t => t.name.includes('topic B'));
   // Should not throw even with no path
   const result = createDormantSummary(entries, topicB, 'Summary B');
@@ -864,7 +864,7 @@ console.log('\ndormant pair structure validation');
 
 test('dormant assistant entry has stop_reason tool_use', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
   const result = createDormantSummary(entries, topic, 'summary text');
   const assistantEntry = result[result.length - 2];
@@ -873,7 +873,7 @@ test('dormant assistant entry has stop_reason tool_use', () => {
 
 test('dormant assistant content[0] is Agent tool_use', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
   const result = createDormantSummary(entries, topic, 'summary text');
   const assistantEntry = result[result.length - 2];
@@ -884,7 +884,7 @@ test('dormant assistant content[0] is Agent tool_use', () => {
 
 test('dormant result entry content[0] is tool_result with array content', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
   const result = createDormantSummary(entries, topic, 'summary text');
   const resultEntry = result[result.length - 1];
@@ -896,7 +896,7 @@ test('dormant result entry content[0] is tool_result with array content', () => 
 
 test('dormant result entry has promptId set', () => {
   const entries = makeChain(['start', 'Now work', 'done']);
-  const topics = getTopics(entries);
+  const topics = getTopics(entries, { minMessages: 0 });
   const topic = topics.find(t => t.name.includes('work'));
   const result = createDormantSummary(entries, topic, 'summary text');
   const resultEntry = result[result.length - 1];
