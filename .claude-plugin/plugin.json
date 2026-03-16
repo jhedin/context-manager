@@ -1,7 +1,7 @@
 {
   "name": "context-manager",
   "description": "Session history pruning, summarization, branching, and context management for Claude Code",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": {
     "name": "jhedin"
   },
