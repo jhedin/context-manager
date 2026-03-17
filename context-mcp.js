@@ -974,9 +974,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ["backup_name"]
       }
+    },
+    {
+      name: "search_history",
+      description: "Search session history for topics matching a query. Searches topic names and dormant summary text across all session files in the project directory (or just the current session). Returns matching topics with their summaries and optionally full content.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search string (case-insensitive substring match)" },
+          include_full_content: { type: "boolean", description: "If true, include full topic message content in results (default false)" },
+          session_scope: { type: "string", enum: ["current", "all"], description: "Search only current session or all sessions in the project directory (default: all)" },
+          session_path: { type: "string" }
+        },
+        required: ["query"]
+      }
     }
   ]
 }));
+
+// --- History search ---
+
+/**
+ * Find all session JSONL files in the same project directory as the given session file.
+ * Project directories are ~/.claude/projects/<hash>/ or ./.claude/.
+ * Returns an array of absolute paths, current session file first.
+ */
+function findProjectSessionFiles(sessionFilePath) {
+  const dir = path.dirname(path.resolve(sessionFilePath));
+  try {
+    return fs.readdirSync(dir)
+      .filter(f => f.endsWith('.jsonl') && !f.includes('subagents'))
+      .map(f => path.join(dir, f))
+      .sort((a, b) => {
+        // Current session first, then newest first
+        if (a === path.resolve(sessionFilePath)) return -1;
+        if (b === path.resolve(sessionFilePath)) return 1;
+        return fs.statSync(b).mtime - fs.statSync(a).mtime;
+      });
+  } catch (_) {
+    return [path.resolve(sessionFilePath)];
+  }
+}
+
+/**
+ * Extract the summary text from a dormant summary result entry.
+ */
+function extractSummaryText(resultEntry) {
+  const content = resultEntry?.message?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (block.type === 'tool_result') {
+      const inner = block.content;
+      if (Array.isArray(inner)) {
+        return inner.map(b => b.text || '').join('');
+      }
+      if (typeof inner === 'string') return inner;
+    }
+  }
+  return null;
+}
+
+/**
+ * Search a single session file for topics matching the query.
+ * Returns an array of match objects.
+ */
+function searchSessionFile(filePath, queryLower, includeFullContent) {
+  let entries;
+  try {
+    entries = readHistory(filePath);
+  } catch (_) {
+    return [];
+  }
+  if (entries.length === 0) return [];
+
+  const topics = getTopics(entries);
+  const matches = [];
+
+  for (const topic of topics) {
+    const dormant = findDormantSummary(entries, topic.id);
+    const summaryText = dormant ? extractSummaryText(dormant.resultEntry) : null;
+
+    // Match against topic name and summary text
+    const nameMatch = topic.name.toLowerCase().includes(queryLower);
+    const summaryMatch = summaryText && summaryText.toLowerCase().includes(queryLower);
+
+    if (!nameMatch && !summaryMatch) continue;
+
+    const match = {
+      topic_id: topic.id,
+      topic_name: topic.name,
+      session_file: path.basename(filePath),
+      message_count: topic.messages.length,
+      has_summary: !!summaryText,
+      summary: summaryText || null,
+    };
+
+    if (includeFullContent) {
+      match.content = extractTopicContent(entries, topic);
+    }
+
+    matches.push(match);
+  }
+
+  return matches;
+}
 
 // --- Tool handlers ---
 
@@ -1474,6 +1575,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     );
   }
 
+  if (toolName === "search_history") {
+    if (!args.query) return textResult("query is required.");
+    const queryLower = args.query.toLowerCase();
+    const includeFullContent = !!args.include_full_content;
+    const scope = args.session_scope || 'all';
+
+    const sessionFiles = scope === 'current'
+      ? [filePath]
+      : findProjectSessionFiles(filePath);
+
+    const allMatches = [];
+    for (const sessionFile of sessionFiles) {
+      const matches = searchSessionFile(sessionFile, queryLower, includeFullContent);
+      allMatches.push(...matches);
+    }
+
+    if (allMatches.length === 0) {
+      return textResult(`No topics found matching "${args.query}" in ${sessionFiles.length} session file(s).`);
+    }
+
+    const lines = allMatches.map((m, i) => {
+      const parts = [
+        `\n--- Match ${i + 1}: "${m.topic_name}" (${m.message_count} msgs, ${m.session_file})`,
+        `Topic ID: ${m.topic_id}`,
+      ];
+      if (m.summary) {
+        parts.push(`Summary:\n${m.summary}`);
+      } else {
+        parts.push(`[No summary available]`);
+      }
+      if (m.content) {
+        parts.push(`Full content:\n${m.content}`);
+      }
+      return parts.join('\n');
+    });
+
+    return textResult(
+      `Found ${allMatches.length} match(es) for "${args.query}" across ${sessionFiles.length} session file(s):` +
+      lines.join('\n')
+    );
+  }
+
   return textResult(`Unknown tool: ${toolName}`);
 });
 
@@ -1484,7 +1627,8 @@ if (typeof module !== 'undefined') {
     analyzeEntry, getTopics, scorePruningCandidates, checkForInflightWork,
     bypassTopic, restoreTopic, createDormantSummary, findDormantSummary,
     activateSummary, summarizeTopic, findTopicById, validateSessionPath,
-    guardInflight, readHistory, safeWriteHistory, extractTopicContent
+    guardInflight, readHistory, safeWriteHistory, extractTopicContent,
+    findProjectSessionFiles, searchSessionFile
   };
 }
 
